@@ -19,6 +19,17 @@ from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
 
+# Compile-safe snapshot of flash_comm_v1_enabled.
+# Written once per forward context setup (set_ascend_forward_context), before torch.compile
+# ever runs fake tensor propagation. Fake impls must not read _EXTRA_CTX / get_forward_context()
+# because PiecewiseBackend.compile_all_ranges() fires outside any active forward context.
+_FLASH_COMM_V1_SNAPSHOT: bool = False
+
+
+def set_flash_comm_v1_snapshot(value: bool) -> None:
+    global _FLASH_COMM_V1_SNAPSHOT
+    _FLASH_COMM_V1_SNAPSHOT = value
+
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
     try:
@@ -37,7 +48,7 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
     return residual
 
 
-def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
+def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
     except AssertionError:
@@ -47,14 +58,17 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     if flash_comm_v1_enabled and label:
         dp_metadata = forward_context.dp_metadata
         if dp_metadata is None or not is_ep_comm:
-            x = tensor_model_parallel_all_gather(x, 0)
+            # for better overlap when enabling dbo
+            if do_comm:
+                x = tensor_model_parallel_all_gather(x, 0)
             pad_size = _EXTRA_CTX.pad_size
             if pad_size > 0:
                 x = x[:-pad_size]
         else:
-            x = get_ep_group().all_gather(x, 0)
-            if enable_sp_by_pass():  # TODO: do unpad
-                return x
+            if do_comm:
+                x = get_ep_group().all_gather(x, 0)
+                if enable_sp_by_pass():  # TODO: do unpad
+                    return x
             # unpad
             num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
             result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
@@ -70,25 +84,32 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
-def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
+def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
     except AssertionError:
-        return tensor_model_parallel_all_reduce(x)
+        if do_comm:
+            return tensor_model_parallel_all_reduce(x)
+        return x
 
     flash_comm_v1_enabled = getattr(forward_context, "flash_comm_v1_enabled", False) or (
         enable_sp_by_pass() and is_ep_comm
     )
 
     if not flash_comm_v1_enabled or (forward_context.is_draft_model and is_vl_model() and not is_ep_comm):
-        return tensor_model_parallel_all_reduce(x)
+        if do_comm:
+            return tensor_model_parallel_all_reduce(x)
+        return x
 
     dp_metadata = forward_context.dp_metadata
     if dp_metadata is None or not is_ep_comm:
         pad_size = _EXTRA_CTX.pad_size
         if pad_size > 0:
             x = F.pad(x, (0, 0, 0, pad_size))
-        return tensor_model_parallel_reduce_scatter(x, 0)
+        # for better overlap when enabling dbo
+        if do_comm:
+            x = tensor_model_parallel_reduce_scatter(x, 0)
+        return x
     else:
         if enable_sp_by_pass():
             return get_ep_group().reduce_scatter(x.view(-1, *x.shape[1:]), 0)
@@ -102,11 +123,16 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False) -> tor
             padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
             offset += num_tokens_dp
 
-        return get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+        if do_comm:
+            res = get_ep_group().reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+        else:
+            res = padded_x.view(-1, *x.shape[1:])
+        return res
 
 
-def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled and label:
+# get flashcomm1/flashcomm2 snapshot and dp_metadata snapshot for fake impls, instead of reading them from _EXTRA_CTX / get_forward_context() at runtime, which is not compile safe.
+def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
+    if (_FLASH_COMM_V1_SNAPSHOT or (enable_sp_by_pass() and is_ep_comm)) and label and do_comm:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -114,8 +140,8 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
-def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> torch.Tensor:
-    if _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass():
+def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
+    if (_FLASH_COMM_V1_SNAPSHOT or enable_sp_by_pass()) and do_comm:
         return torch.empty(
             (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )

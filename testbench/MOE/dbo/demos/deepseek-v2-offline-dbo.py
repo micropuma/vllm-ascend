@@ -133,6 +133,10 @@ def run_inference(enable_dbo: bool) -> tuple[float, list]:
         # 生产环境不需要设置这个，保持默认 512 即可
         dbo_prefill_token_threshold=DBO_THRESHOLD if enable_dbo else 512,
         dbo_decode_token_threshold=max(1, DBO_THRESHOLD // 16) if enable_dbo else 32,
+        # On Ascend A2, MoE uses ALL_GATHER (not ALL_TO_ALL), so the
+        # all2all_backend parameter is a no-op. However, upstream vLLM
+        # validates that enable_dbo=True requires a deepep all2all backend.
+        all2all_backend="deepep_low_latency" if enable_dbo else "allgather_reducescatter",
     )
 
     # warmup（不计时）
