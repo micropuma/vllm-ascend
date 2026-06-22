@@ -23,6 +23,7 @@ import functools
 import json
 import math
 import os
+import threading
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -461,6 +462,22 @@ def prefetch_stream() -> torch.npu.Stream:
         # we return the default stream.
         _PREFETCH_STREAM = torch_npu.npu.Stream()
     return _PREFETCH_STREAM
+
+
+def dbo_current_stream() -> torch.npu.Stream:
+    if not hasattr(_current_stream_tls, "value") or _current_stream_tls.value is None:
+        _current_stream_tls.value = torch.npu.current_stream()
+    return _current_stream_tls.value
+
+
+prev_set_stream = torch.npu.set_stream
+
+_current_stream_tls = threading.local()
+
+
+def dbo_set_stream(stream: torch.npu.Stream) -> None:
+    _current_stream_tls.value = stream
+    prev_set_stream(stream)
 
 
 def set_weight_prefetch_method(weight_prefetch_config: WeightPrefetchConfig):

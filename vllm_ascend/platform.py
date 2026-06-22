@@ -682,7 +682,13 @@ class NPUPlatform(Platform):
         if parallel_config and parallel_config.worker_cls == "auto":
             # TODO: this is a tricky way to disable `use_sequence_parallel_moe` in vllm.
             if not vllm_config.compilation_config.pass_config.enable_sp:
-                parallel_config.all2all_backend = "flashinfer_all2allv"
+                # When DBO (dual batch overlap) is enabled, upstream vLLM requires
+                # the all2all_backend to be one of the deepep backends. On Ascend A2,
+                # MoE communication uses ALL_GATHER so this is a no-op.
+                if parallel_config.enable_dbo:
+                    parallel_config.all2all_backend = "deepep_low_latency"
+                else:
+                    parallel_config.all2all_backend = "flashinfer_all2allv"
             if is_310p():
                 parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
             elif ascend_config.xlite_graph_config.enabled:
@@ -1243,21 +1249,6 @@ class NPUPlatform(Platform):
                     "topo-affinity core allocation."
                 )
                 vllm_config.parallel_config.numa_bind_cpus = None
-
-            if getattr(vllm_config.parallel_config, "enable_dbo", False):
-                logger.warning(
-                    "Parameter is currently ignored on Ascend. parameter=enable_dbo, action: resetting to False. "
-                )
-                vllm_config.parallel_config.enable_dbo = False
-
-            ubatch_size = getattr(vllm_config.parallel_config, "ubatch_size", 0)
-            if ubatch_size != 0:
-                logger.warning(
-                    "Parameter is currently ignored on Ascend. "
-                    "parameter=ubatch_size, value=%d, action: resetting to 0. ",
-                    ubatch_size,
-                )
-                vllm_config.parallel_config.ubatch_size = 0
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:

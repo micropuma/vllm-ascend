@@ -157,7 +157,9 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.npu_ubatch_wrapper import AscendUBatchWrapper
 from vllm_ascend.worker.pcp_utils import PCPManager
+from vllm_ascend.worker.ubatch_utils import check_enable_ubatch
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -672,8 +674,8 @@ class NPUModelRunner(GPUModelRunner):
         return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
 
     def get_model(self) -> nn.Module:
-        # get raw model out of the aclgraph wrapper.
-        if isinstance(self.model, ACLGraphWrapper):
+        # get raw model out of the aclgraph / ubatch wrapper.
+        if isinstance(self.model, (ACLGraphWrapper, AscendUBatchWrapper)):
             return self.model.unwrap()
         return self.model
 
@@ -2229,6 +2231,7 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
+                ubatch_slices=ubatch_slices_attn,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2752,7 +2755,7 @@ class NPUModelRunner(GPUModelRunner):
                 forward_context, num_tokens_padded, positions
             )
 
-        if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
+        if forward_context.flash_comm_v1_enabled and not get_forward_context().dbo_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
 
@@ -2867,7 +2870,9 @@ class NPUModelRunner(GPUModelRunner):
             )
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
-        should_ubatch, num_tokens_across_dp = False, None
+        from vllm_ascend.ascend_forward_context import select_moe_comm_method
+
+        num_tokens_across_dp = None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
@@ -2887,6 +2892,14 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+
+        should_ubatch = check_enable_ubatch(
+            num_tokens_padded,
+            num_tokens_padded,
+            uniform_decode=False,
+            vllm_config=self.vllm_config,
+            moe_comm_type=select_moe_comm_method(num_tokens_padded, self.vllm_config),
+        )
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -3636,13 +3649,19 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(
-                self.model,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-                use_eagle=self.use_eagle,
-                enable_enpu=self.enable_enpu,
-            )
+            if not self.parallel_config.enable_dbo:
+                self.model = ACLGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
+            else:
+                # TODO(zxdu): check eagle/enpu support for dbo
+                self.model = AscendUBatchWrapper(self.model, self.vllm_config, CUDAGraphMode.FULL, self.device)
+        elif self.parallel_config.enable_dbo:
+            self.model = AscendUBatchWrapper(self.model, self.vllm_config, CUDAGraphMode.NONE, self.device)
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()

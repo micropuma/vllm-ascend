@@ -20,8 +20,14 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
+from vllm.distributed import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
 from vllm.distributed.parallel_state import (
     get_dp_group,
+    get_ep_group,
     get_pcp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -31,6 +37,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.dbo.compile_guard import _dbo_call_moe_prepare_hook, _dbo_call_moe_finalize_hook
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -378,16 +385,38 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
             with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=self.multistream_overlap_gate):
                 hidden_states = fc3_all_gather_and_maybe_unpad_impl(hidden_states)
+            if pertoken_scale is not None:
+                pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
         else:
-            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
-            router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
+            forward_context = get_forward_context()
+            if forward_context.dbo_enabled:
+                _dbo_call_moe_prepare_hook(forward_context, is_record=True)
+                if get_forward_context().flash_comm_v1_enabled:
+                    if get_forward_context().dp_metadata is None:
+                        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+                        router_logits = tensor_model_parallel_all_gather(router_logits, 0)
+                        if pertoken_scale is not None:
+                            pertoken_scale = tensor_model_parallel_all_gather(pertoken_scale, 0)
+                    else:
+                        hidden_states = get_ep_group().all_gather(hidden_states, 0)
+                        router_logits = get_ep_group().all_gather(router_logits, 0)
+                        if pertoken_scale is not None:
+                            pertoken_scale = get_ep_group().all_gather(pertoken_scale, 0)
+                    # A2 DBO for FC1/FC2, overlap the comm of o_proj + moe prepare
+                    _dbo_call_moe_prepare_hook(forward_context, is_record=False)
+                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True, False)
+                router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True, False)
+                if pertoken_scale is not None:
+                    pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True, False)
+            else:
+                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
+                router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
+                if pertoken_scale is not None:
+                    pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
 
         # TODO(fuzhihong): To adapt to self.num_token in the all_gather_input_id_with_dp_group method,
         #  when flashcomm1 is used and dp = N(N >=2).
         self.num_tokens = hidden_states.shape[0]
-
-        if pertoken_scale is not None:
-            pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
 
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(PrepareAndFinalize.quant_stream)
@@ -519,7 +548,23 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
             hidden_states = hidden_states[: self.num_tokens_pcp]
 
-        hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
+        # A2 DBO for FC1/FC2, overlap the moe finalize + mla allgather
+        forward_context = get_forward_context()
+        if forward_context.dbo_enabled:
+            hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True, do_comm=False)
+            _dbo_call_moe_finalize_hook(forward_context, is_record=True)
+            if get_forward_context().flash_comm_v1_enabled:
+                if get_forward_context().dp_metadata is None:
+                    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+                else:
+                    hidden_states = get_ep_group().reduce_scatter(hidden_states, 0)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+            _dbo_call_moe_finalize_hook(forward_context, is_record=False)
+
+        else:
+            hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
 
         return hidden_states
 
