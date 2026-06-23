@@ -107,7 +107,7 @@ DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-1000000000}
 # Profiler config
 # ------------------------------------------------------------
 ENABLE_PROFILER=${ENABLE_PROFILER:-0}
-PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend-dbo/profile}
+PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
 TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/dbo_profile}
 
 # profiler 时建议小一点，避免 trace 爆炸

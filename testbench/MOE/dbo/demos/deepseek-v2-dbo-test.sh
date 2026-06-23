@@ -87,8 +87,8 @@ WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-16}
 # Optional detailed request records. Useful when locating TTFT / ITL tails.
 SAVE_DETAILED=${SAVE_DETAILED:-0}
 
-OUT_DIR=${OUT_DIR:-/data/workspace/vllm-ascend-dbo/testbench/MOE/dbo/results}
-PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend-dbo/profile}
+OUT_DIR=${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/results}
+PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
 mkdir -p "$OUT_DIR"
 
 # Optional suffix for repeated runs, e.g. RESULT_SUFFIX=_run1.

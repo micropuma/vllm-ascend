@@ -69,10 +69,10 @@ ENABLE_PROFILER=1 PORT=8001 bash deepseek-v2-dbo-server.sh
 LABEL=dbo PORT=8001 bash deepseek-v2-dbo-test.sh --profile
 ```
 
-profiler 数据落到 `/data/workspace/vllm-ascend-dbo/profile/dbo_profile/`，用 Tensorboard 打开：
+profiler 数据落到 `/data/workspace/vllm-ascend/profile/dbo_profile/`，用 Tensorboard 打开：
 
 ```bash
-tensorboard --logdir /data/workspace/vllm-ascend-dbo/profile/dbo_profile/
+tensorboard --logdir /data/workspace/vllm-ascend/profile/dbo_profile/
 ```
 
 ---

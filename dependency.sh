@@ -4,7 +4,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 INDEX_URL="https://mirrors.ustc.edu.cn/pypi/simple"
 TRUSTED_HOST="mirrors.ustc.edu.cn"
-CONSTRAINT_FILE="/data/workspace/vllm-ascend-dbo/ascend_protect_constraints.txt"
+CONSTRAINT_FILE="/data/workspace/vllm-ascend/ascend_protect_constraints.txt"
 
 LOG_DIR="${LOG_DIR:-/data/workspace/pip-dependency-logs}"
 mkdir -p "$LOG_DIR"

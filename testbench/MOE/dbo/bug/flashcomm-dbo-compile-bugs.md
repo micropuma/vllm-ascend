@@ -459,7 +459,7 @@ def _apply_impl_compiled(self, input_):
 
 **原则：MoE 通信整体放入 opaque custom op。**
 
-这是 upstream vLLM 的做法（参见 `vllm-ascend-dbo.md` 第 3 节）：
+这是 upstream vLLM 的做法（参见 `vllm-ascend.md` 第 3 节）：
 - 把整个 MoE `prepare → expert MLP → finalize` 注册为一个 `torch.ops.vllm.ascend_moe_forward` custom op
 - fake impl 返回 `(global_hidden_states, output)` shape
 - real impl 内部处理 AllGather/AllToAll + DBO hook + FlashComm
