@@ -2,6 +2,8 @@
 """Quick check that DBO infrastructure imports correctly after migration."""
 import sys
 
+import torch
+
 # Check 1: Runtime primitives
 from vllm_ascend.worker.ubatching import UBatchEventKey, AscendUBatchContext, dbo_record_current_stream
 print(f"ubatching OK: UBatchEventKey={list(UBatchEventKey)}")
@@ -37,5 +39,14 @@ print(f"npu_ubatch_wrapper OK: {AscendUBatchWrapper.__name__}")
 # Check 9: DeepSeek template
 from vllm_ascend.dbo.overlap_templates.deepseek import DeepseekAllgatherTemplate, DeepseekAlltoallTemplate
 print(f"deepseek templates OK")
+
+# Check 10: Dispatch layer — custom ops (fullgraph-compatible)
+import vllm_ascend.dbo.dispatch  # noqa: F401 — registers custom ops on import
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_column_allgather_mlp}")
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_column_allgather_sp}")
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_row_allreduce}")
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_moe_prepare_allgather}")
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_moe_finalize_allgather}")
+print(f"dispatch OK: {torch.ops.vllm_ascend.dbo_mla_preprocess}")
 
 print("\nAll DBO imports verified successfully!")

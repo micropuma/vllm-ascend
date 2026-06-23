@@ -19,16 +19,11 @@ from vllm_ascend.ops.triton.muls_add import muls_add_triton
 from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch, prefetch_stream
 
-# Compile-safe snapshot of flash_comm_v1_enabled.
-# Written once per forward context setup (set_ascend_forward_context), before torch.compile
-# ever runs fake tensor propagation. Fake impls must not read _EXTRA_CTX / get_forward_context()
-# because PiecewiseBackend.compile_all_ranges() fires outside any active forward context.
-_FLASH_COMM_V1_SNAPSHOT: bool = False
-
-
-def set_flash_comm_v1_snapshot(value: bool) -> None:
-    global _FLASH_COMM_V1_SNAPSHOT
-    _FLASH_COMM_V1_SNAPSHOT = value
+# Re-exported from dbo.snapshot to avoid circular imports with dispatch.py.
+from vllm_ascend.dbo.snapshot import (  # noqa: F401
+    _FLASH_COMM_V1_SNAPSHOT,
+    set_flash_comm_v1_snapshot,
+)
 
 
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:

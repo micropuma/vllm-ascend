@@ -137,7 +137,7 @@ def set_ascend_forward_context(
         forward_context.num_tokens = num_tokens
         forward_context.flash_comm_v1_enabled = flash_comm_v1_enabled
         # Snapshot flash_comm_v1 for compile-safe fake impls
-        from vllm_ascend.ops.register_custom_ops import set_flash_comm_v1_snapshot
+        from vllm_ascend.dbo.snapshot import set_flash_comm_v1_snapshot
 
         set_flash_comm_v1_snapshot(flash_comm_v1_enabled)
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2

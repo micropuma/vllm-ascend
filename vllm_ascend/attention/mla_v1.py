@@ -7,8 +7,6 @@ import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import tensor_model_parallel_all_gather
-from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -23,7 +21,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.dbo.compile_guard import _dbo_call_mla_preprocess_hook
+from vllm_ascend.dbo.dispatch import dbo_mla_preprocess  # noqa: F401 — registers custom op
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata, CPChunkedContextMetadata
@@ -1664,21 +1662,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             q_c = hidden_states
             kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]  # type: ignore[misc]
 
-        # Process for Flash Comm V1
-
-        forward_context = get_forward_context()
-        if forward_context.dbo_enabled:
-            _dbo_call_mla_preprocess_hook(forward_context, is_record=True)
-            if get_forward_context().flash_comm_v1_enabled:
-                q_c = tensor_model_parallel_all_gather(q_c.contiguous(), 0)
-
-                kv_no_split = tensor_model_parallel_all_gather(kv_no_split.contiguous(), 0)
-            _dbo_call_mla_preprocess_hook(forward_context, is_record=False)
-            q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c, need_gather_q_kv, do_comm=False)
-            kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split, need_gather_q_kv, do_comm=False)
-        else:
-            q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c.contiguous(), need_gather_q_kv)
-            kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split.contiguous(), need_gather_q_kv)
+        # Process for Flash Comm V1 (DBO dispatch via compile-safe custom op)
+        q_c, kv_no_split = torch.ops.vllm_ascend.dbo_mla_preprocess.default(
+            q_c, kv_no_split, need_gather_q_kv,
+        )
 
         for layer in self.layer_sharding_kwargs or []:
             if is_hidden_layer(layer):
