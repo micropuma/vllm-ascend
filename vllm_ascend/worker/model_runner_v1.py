@@ -108,7 +108,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention, split_attn_metadata
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -3227,10 +3227,19 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                _build_attn_group_metadata(
-                    kv_cache_gid, attn_gid, cm, num_reqs_actual,
-                    prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata,
-                    common_ratio_to_sas_metadata)
+                if ubatch_slices is not None:  
+                    # for ubatch, we need to build metadata for each ubatch slice
+                    for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
+                        _build_attn_group_metadata(
+                            kv_cache_gid, attn_gid, _cm, num_reqs_actual,
+                            prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata,
+                            common_ratio_to_sas_metadata, ubid)
+                else:
+                    _build_attn_group_metadata(
+                        kv_cache_gid, attn_gid, cm, num_reqs_actual,
+                        prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata,
+                        common_ratio_to_sas_metadata)
+
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -4614,15 +4623,20 @@ class NPUModelRunner(GPUModelRunner):
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
-                attn_metadata_builders = []
-                attn_metadata_builders.append(
+                # Create a metadata builder for each ubatch slot.
+                # When DBO/ubatching is enabled we need >1 builder so that
+                # back-to-back ubatches don't clobber each other's metadata.
+                num_metadata_builders = (
+                    1 if not self.parallel_config.enable_dbo else 2)
+                attn_metadata_builders = [
                     attn_backend.get_builder_cls()(
                         kv_cache_spec,
                         layer_names,
                         self.vllm_config,
                         self.device,
                     )
-                )
+                    for _ in range(num_metadata_builders)
+                ]
                 attn_group = AttentionGroup(
                     attn_backend, layer_names, kv_cache_spec, kv_cache_group_id, attn_metadata_builders
                 )
