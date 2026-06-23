@@ -224,3 +224,4 @@ csrc/third_party/
 
 .vllm_ascend/
 .agents/
+profile/

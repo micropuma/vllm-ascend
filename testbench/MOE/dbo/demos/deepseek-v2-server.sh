@@ -92,7 +92,7 @@ MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 # Profiler config
 # ------------------------------------------------------------
 ENABLE_PROFILER=${ENABLE_PROFILER:-0}
-PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend-dbo/profile}
+PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
 
 # no-DBO 单独目录，避免和 DBO profile 混在一起
 TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/no_dbo_profile}
