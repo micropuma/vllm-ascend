@@ -84,6 +84,32 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
+def _maybe_unpad_after_all_gather_impl(
+    x: torch.Tensor,
+    unpadded_length: int,
+    padded_length: int = 0,
+    use_ep_comm: bool = False,
+) -> torch.Tensor:
+    if not use_ep_comm:
+        return x[:unpadded_length]
+
+    forward_context = get_forward_context()
+    dp_metadata = forward_context.dp_metadata
+    if dp_metadata is None:
+        return x[:unpadded_length]
+
+    result = torch.empty((unpadded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+    dp_size = get_dp_group().world_size
+    x = x.view(dp_size, padded_length, *x.shape[1:])
+    offset = 0
+    for idx in range(dp_size):
+        num_tokens_dp = dp_metadata.num_tokens_across_dp_cpu[idx]
+        result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
+        offset += num_tokens_dp
+
+    return result
+
+
 def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
     try:
         forward_context = get_forward_context()
@@ -140,6 +166,15 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
     return x
 
 
+def _maybe_unpad_after_all_gather_fake(
+    x: torch.Tensor,
+    unpadded_length: int,
+    padded_length: int = 0,
+    use_ep_comm: bool = False,
+) -> torch.Tensor:
+    return torch.empty((unpadded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+
+
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
     if (_FLASH_COMM_V1_SNAPSHOT or enable_sp_by_pass()) and do_comm:
         return torch.empty(
@@ -149,12 +184,49 @@ def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_com
     return x
 
 
+def _maybe_prepare_for_reduce_impl(
+    x: torch.Tensor,
+    prepared_length: int,
+    padded_length: int = 0,
+    use_ep_comm: bool = False,
+) -> torch.Tensor:
+    if not use_ep_comm:
+        pad_size = prepared_length - x.shape[0]
+        if pad_size > 0:
+            x = F.pad(x, (0, 0, 0, pad_size))
+        return x
+
+    forward_context = get_forward_context()
+    dp_metadata = forward_context.dp_metadata
+    if dp_metadata is None:
+        return x
+
+    dp_size = get_dp_group().world_size
+    padded_x = torch.empty((dp_size, padded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
+    offset = 0
+    for idx in range(dp_size):
+        num_tokens_dp = dp_metadata.num_tokens_across_dp_cpu[idx]
+        padded_x[idx, :num_tokens_dp] = x[offset : offset + num_tokens_dp]
+        offset += num_tokens_dp
+
+    return padded_x.view(prepared_length, *x.shape[1:])
+
+
 def _prefetch_preprocess_impl(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
     calculation_stream = torch_npu.npu.current_stream()
     weight_prefetch_stream = prefetch_stream()
     weight_prefetch_stream.wait_stream(calculation_stream)
     with npu_stream_switch(weight_prefetch_stream):
         maybe_npu_prefetch(inputs=weight, dependency=start_flag, max_size=max_weight_size)
+
+
+def _maybe_prepare_for_reduce_fake(
+    x: torch.Tensor,
+    prepared_length: int,
+    padded_length: int = 0,
+    use_ep_comm: bool = False,
+) -> torch.Tensor:
+    return torch.empty((prepared_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
 
 def _prefetch_preprocess_impl_fake(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
@@ -260,9 +332,25 @@ direct_register_custom_op(
 )
 
 direct_register_custom_op(
+    op_name="maybe_unpad_after_all_gather",
+    op_func=_maybe_unpad_after_all_gather_impl,
+    fake_impl=_maybe_unpad_after_all_gather_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
     op_name="maybe_pad_and_reduce",
     op_func=_maybe_pad_and_reduce_impl,
     fake_impl=_maybe_pad_and_reduce_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="maybe_prepare_for_reduce",
+    op_func=_maybe_prepare_for_reduce_impl,
+    fake_impl=_maybe_prepare_for_reduce_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

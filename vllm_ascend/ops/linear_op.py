@@ -454,12 +454,13 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
             _dbo_call_linear_column_hook(forward_context, is_record=True)
-            if get_forward_context().flash_comm_v1_enabled and need_all_gather:
+            if forward_context.flash_comm_v1_enabled and need_all_gather:
                 input_ = tensor_model_parallel_all_gather(input_, 0)
 
             _dbo_call_linear_column_hook(forward_context, is_record=False)
 
-            input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, do_comm=False, label=need_all_gather)
+            if forward_context.flash_comm_v1_enabled and need_all_gather:
+                input_ = torch.ops.vllm.maybe_unpad_after_all_gather(input_, forward_context.num_tokens)
         else:
             input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
 
