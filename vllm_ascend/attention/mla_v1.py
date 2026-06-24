@@ -1669,13 +1669,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
             _dbo_call_mla_preprocess_hook(forward_context, is_record=True)
-            if get_forward_context().flash_comm_v1_enabled:
+            if forward_context.flash_comm_v1_enabled and need_gather_q_kv:
                 q_c = tensor_model_parallel_all_gather(q_c.contiguous(), 0)
-
                 kv_no_split = tensor_model_parallel_all_gather(kv_no_split.contiguous(), 0)
             _dbo_call_mla_preprocess_hook(forward_context, is_record=False)
-            q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c, need_gather_q_kv, do_comm=False)
-            kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split, need_gather_q_kv, do_comm=False)
+            if forward_context.flash_comm_v1_enabled and need_gather_q_kv:
+                q_c = torch.ops.vllm.maybe_unpad_after_all_gather(q_c, forward_context.num_tokens)
+                kv_no_split = torch.ops.vllm.maybe_unpad_after_all_gather(kv_no_split, forward_context.num_tokens)
         else:
             q_c = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(q_c.contiguous(), need_gather_q_kv)
             kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(kv_no_split.contiguous(), need_gather_q_kv)

@@ -390,24 +390,44 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         else:
             forward_context = get_forward_context()
             if forward_context.dbo_enabled:
-                _dbo_call_moe_prepare_hook(forward_context, is_record=True)
-                if get_forward_context().flash_comm_v1_enabled:
-                    if get_forward_context().dp_metadata is None:
-                        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-                        router_logits = tensor_model_parallel_all_gather(router_logits, 0)
-                        if pertoken_scale is not None:
-                            pertoken_scale = tensor_model_parallel_all_gather(pertoken_scale, 0)
+                flash_comm_enabled = forward_context.flash_comm_v1_enabled
+                use_ep_comm = forward_context.dp_metadata is not None
+                if flash_comm_enabled:
+                    if use_ep_comm:
+                        unpadded_length = int(forward_context.dp_metadata.num_tokens_across_dp_cpu.sum().item())
+                        padded_length = forward_context.padded_length
                     else:
+                        unpadded_length = forward_context.num_tokens
+                        padded_length = 0
+                else:
+                    unpadded_length = 0
+                    padded_length = 0
+
+                _dbo_call_moe_prepare_hook(forward_context, is_record=True)
+                if flash_comm_enabled:
+                    if use_ep_comm:
                         hidden_states = get_ep_group().all_gather(hidden_states, 0)
                         router_logits = get_ep_group().all_gather(router_logits, 0)
                         if pertoken_scale is not None:
                             pertoken_scale = get_ep_group().all_gather(pertoken_scale, 0)
+                    else:
+                        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+                        router_logits = tensor_model_parallel_all_gather(router_logits, 0)
+                        if pertoken_scale is not None:
+                            pertoken_scale = tensor_model_parallel_all_gather(pertoken_scale, 0)
                     # A2 DBO for FC1/FC2, overlap the comm of o_proj + moe prepare
                     _dbo_call_moe_prepare_hook(forward_context, is_record=False)
-                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True, False)
-                router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True, False)
-                if pertoken_scale is not None:
-                    pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True, False)
+                if flash_comm_enabled:
+                    hidden_states = torch.ops.vllm.maybe_unpad_after_all_gather(
+                        hidden_states, unpadded_length, padded_length, use_ep_comm
+                    )
+                    router_logits = torch.ops.vllm.maybe_unpad_after_all_gather(
+                        router_logits, unpadded_length, padded_length, use_ep_comm
+                    )
+                    if pertoken_scale is not None:
+                        pertoken_scale = torch.ops.vllm.maybe_unpad_after_all_gather(
+                            pertoken_scale, unpadded_length, padded_length, use_ep_comm
+                        )
             else:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
                 router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
@@ -551,16 +571,31 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         # A2 DBO for FC1/FC2, overlap the moe finalize + mla allgather
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True, do_comm=False)
-            _dbo_call_moe_finalize_hook(forward_context, is_record=True)
-            if get_forward_context().flash_comm_v1_enabled:
-                if get_forward_context().dp_metadata is None:
-                    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+            flash_comm_enabled = forward_context.flash_comm_v1_enabled
+            use_ep_comm = forward_context.dp_metadata is not None
+            if flash_comm_enabled:
+                if use_ep_comm:
+                    prepared_length = get_dp_group().world_size * forward_context.padded_length
+                    padded_length = forward_context.padded_length
                 else:
+                    prepared_length = forward_context.num_tokens + forward_context.pad_size
+                    padded_length = prepared_length
+            else:
+                prepared_length = 0
+                padded_length = 0
+
+            if flash_comm_enabled:
+                hidden_states = torch.ops.vllm.maybe_prepare_for_reduce(
+                    hidden_states, prepared_length, padded_length, use_ep_comm
+                )
+            _dbo_call_moe_finalize_hook(forward_context, is_record=True)
+            if flash_comm_enabled:
+                if use_ep_comm:
                     hidden_states = get_ep_group().reduce_scatter(hidden_states, 0)
+                else:
+                    hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-
             _dbo_call_moe_finalize_hook(forward_context, is_record=False)
 
         else:
