@@ -391,12 +391,23 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             if pertoken_scale is not None:
                 pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
         else:
+            flash_comm_enabled = _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass()
+            tp_size = get_tensor_model_parallel_world_size()
+            output_num_tokens = (
+                _EXTRA_CTX.num_tokens
+                if flash_comm_enabled
+                else 0
+            )
             hidden_states, router_logits, pertoken_scale = (
                 torch.ops.vllm_ascend.dbo_moe_prepare_allgather.default(
-                    hidden_states, router_logits,
+                    hidden_states,
+                    router_logits,
                     pertoken_scale
                     if pertoken_scale is not None
                     else torch.empty(0, device=hidden_states.device),
+                    flash_comm_enabled,
+                    tp_size,
+                    output_num_tokens,
                 )
             )
             if pertoken_scale.numel() == 0:
@@ -536,7 +547,12 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
             hidden_states = hidden_states[: self.num_tokens_pcp]
 
-        hidden_states = torch.ops.vllm_ascend.dbo_moe_finalize_allgather.default(hidden_states)
+        flash_comm_enabled = _EXTRA_CTX.flash_comm_v1_enabled or enable_sp_by_pass()
+        hidden_states = torch.ops.vllm_ascend.dbo_moe_finalize_allgather.default(
+            hidden_states,
+            flash_comm_enabled,
+            get_tensor_model_parallel_world_size(),
+        )
         return hidden_states
 
     def _finalize_with_dp_group(self, hidden_states: torch.Tensor, reduce_results: bool) -> torch.Tensor:

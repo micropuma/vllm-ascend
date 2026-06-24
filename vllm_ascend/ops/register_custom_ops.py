@@ -21,7 +21,7 @@ from vllm_ascend.utils import enable_sp_by_pass, is_vl_model, npu_stream_switch,
 
 # Re-exported from dbo.snapshot to avoid circular imports with dispatch.py.
 from vllm_ascend.dbo.snapshot import (  # noqa: F401
-    _FLASH_COMM_V1_SNAPSHOT,
+    get_flash_comm_v1_snapshot,
     set_flash_comm_v1_snapshot,
 )
 
@@ -127,7 +127,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor, is_ep_comm: bool = False, do_com
 
 # get flashcomm1/flashcomm2 snapshot and dp_metadata snapshot for fake impls, instead of reading them from _EXTRA_CTX / get_forward_context() at runtime, which is not compile safe.
 def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
-    if (_FLASH_COMM_V1_SNAPSHOT or (enable_sp_by_pass() and is_ep_comm)) and label and do_comm:
+    if (get_flash_comm_v1_snapshot() or (enable_sp_by_pass() and is_ep_comm)) and label and do_comm:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
         )
@@ -136,9 +136,12 @@ def _maybe_all_gather_and_maybe_unpad_fake(x: torch.Tensor, label: bool, is_ep_c
 
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
-    if (_FLASH_COMM_V1_SNAPSHOT or enable_sp_by_pass()) and do_comm:
+    if (get_flash_comm_v1_snapshot() or enable_sp_by_pass()) and do_comm:
+        tp_size = get_tensor_model_parallel_world_size()
         return torch.empty(
-            (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
+            ((x.shape[0] + tp_size - 1) // tp_size, *x.shape[1:]),
+            device=x.device,
+            dtype=x.dtype,
         )
 
     return x

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -1662,9 +1663,21 @@ class AscendMLAImpl(MLAAttentionImpl):
             q_c = hidden_states
             kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]  # type: ignore[misc]
 
-        # Process for Flash Comm V1 (DBO dispatch via compile-safe custom op)
+        # Process for Flash Comm V1 (DBO dispatch via compile-safe custom op).
+        # Shape metadata is explicit so fake impls do not read runtime context.
+        flash_comm_enabled = _EXTRA_CTX.flash_comm_v1_enabled
+        output_num_tokens = (
+            _EXTRA_CTX.num_tokens
+            if flash_comm_enabled and need_gather_q_kv
+            else 0
+        )
         q_c, kv_no_split = torch.ops.vllm_ascend.dbo_mla_preprocess.default(
-            q_c, kv_no_split, need_gather_q_kv,
+            q_c,
+            kv_no_split,
+            need_gather_q_kv,
+            flash_comm_enabled,
+            get_tensor_model_parallel_world_size(),
+            output_num_tokens,
         )
 
         for layer in self.layer_sharding_kwargs or []:

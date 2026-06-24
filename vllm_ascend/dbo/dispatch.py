@@ -17,39 +17,28 @@ Non-DBO path cost: one extra custom-op invocation whose real impl checks
 ``torch.ops.vllm.*`` call — negligible overhead.
 """
 
-from typing import Optional
-
 import torch
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-
-from vllm_ascend.dbo.snapshot import _FLASH_COMM_V1_SNAPSHOT
-import sys; _dbo_log = sys.stderr
 
 
-def _safe_sp_enabled() -> bool:
-    """Check if sequence parallelism is enabled, safe for fake-impl context."""
-    if _FLASH_COMM_V1_SNAPSHOT:
-        return True
-    try:
-        from vllm_ascend.utils import enable_sp_by_pass
-        return enable_sp_by_pass()
-    except Exception:
-        return False
+def _fake_empty_dim0(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    return torch.empty(
+        (num_tokens, *x.shape[1:]),
+        device=x.device,
+        dtype=x.dtype,
+    )
 
 
-def _safe_tp_size() -> int:
-    """Get TP world size, safe for fake-impl context."""
-    try:
-        return get_tensor_model_parallel_world_size()
-    except Exception:
-        return 1
+def _fake_all_gather_dim0(x: torch.Tensor, world_size: int) -> torch.Tensor:
+    return _fake_empty_dim0(x, x.shape[0] * world_size)
+
+
+def _fake_reduce_scatter_dim0(x: torch.Tensor, world_size: int) -> torch.Tensor:
+    return _fake_empty_dim0(x, (x.shape[0] + world_size - 1) // world_size)
 
 
 # Re-export snapshot so callers can set it without importing register_custom_ops
@@ -103,6 +92,7 @@ def _call_dbo_hook(hook_name: str, is_record: bool):
 @torch.library.custom_op("vllm_ascend::dbo_column_allgather_mlp", mutates_args=())
 def dbo_column_allgather_mlp(
     input_: torch.Tensor,
+    tp_size: int,
 ) -> torch.Tensor:
     """Real impl — runs at runtime only, safe to call ``get_forward_context()``."""
     fc = _get_fc_attr("dbo_enabled", False)
@@ -120,14 +110,9 @@ def dbo_column_allgather_mlp(
 
 
 @dbo_column_allgather_mlp.register_fake
-def _(input_: torch.Tensor) -> torch.Tensor:
-    """Fake impl — AllGather expands dim 0 by TP size."""
-    tp = _safe_tp_size()
-    print("dbo_column_allgather_mlp FAKE: in=%s tp=%s out=%s", input_.shape, tp, (input_.shape[0]*tp, *input_.shape[1:]))
-    return torch.empty(
-        (input_.shape[0] * tp, *input_.shape[1:]),
-        device=input_.device, dtype=input_.dtype,
-    )
+def _(input_: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Fake impl — AllGather expands dim 0 by explicit TP size."""
+    return _fake_all_gather_dim0(input_, tp_size)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -138,6 +123,9 @@ def _(input_: torch.Tensor) -> torch.Tensor:
 def dbo_column_allgather_sp(
     input_: torch.Tensor,
     need_gather: bool,
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
 ) -> torch.Tensor:
     """Real impl — DBO-aware maybe_all_gather_and_maybe_unpad wrapper."""
     from vllm.forward_context import get_forward_context
@@ -158,13 +146,17 @@ def dbo_column_allgather_sp(
 
 
 @dbo_column_allgather_sp.register_fake
-def _(input_: torch.Tensor, need_gather: bool) -> torch.Tensor:
-    """Fake impl — if FlashComm1 is on AND need_gather, dim-0 expands."""
-    print("dbo_column_allgather_sp FAKE: in=%s need_gather=%s sp=%s tp=%s", input_.shape, need_gather, _safe_sp_enabled(), _safe_tp_size())
-    if _safe_sp_enabled() and need_gather:
-        tp = _safe_tp_size()
+def _(
+    input_: torch.Tensor,
+    need_gather: bool,
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
+) -> torch.Tensor:
+    """Fake impl — explicit metadata mirrors all-gather plus unpad."""
+    if flash_comm_enabled and need_gather:
         return torch.empty(
-            (input_.shape[0] * tp, *input_.shape[1:]),
+            (output_num_tokens, *input_.shape[1:]),
             device=input_.device,
             dtype=input_.dtype,
         )
@@ -205,6 +197,9 @@ def dbo_moe_prepare_allgather(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     pertoken_scale: torch.Tensor,  # empty (shape [0]) tensor when not used
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Real impl — DBO-aware MoE prepare (AllGather path)."""
     from vllm.forward_context import get_forward_context
@@ -256,9 +251,22 @@ def _(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     pertoken_scale: torch.Tensor,
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fake impl — shape unchanged by AllGather (pad/unpad within do_comm)."""
-    print("dbo_moe_prepare FAKE: hs=%s rl=%s", hidden_states.shape, router_logits.shape)
+    """Fake impl — explicit metadata mirrors all-gather plus unpad."""
+    if flash_comm_enabled:
+        return (
+            _fake_empty_dim0(hidden_states, output_num_tokens),
+            _fake_empty_dim0(router_logits, output_num_tokens),
+            (
+                torch.empty_like(pertoken_scale)
+                if pertoken_scale.numel() == 0
+                else _fake_empty_dim0(pertoken_scale, output_num_tokens)
+            ),
+        )
+
     return (
         torch.empty_like(hidden_states),
         torch.empty_like(router_logits),
@@ -273,6 +281,8 @@ def _(
 @torch.library.custom_op("vllm_ascend::dbo_moe_finalize_allgather", mutates_args=())
 def dbo_moe_finalize_allgather(
     hidden_states: torch.Tensor,
+    flash_comm_enabled: bool,
+    tp_size: int,
 ) -> torch.Tensor:
     """Real impl — DBO-aware MoE finalize (AllGather path)."""
     from vllm.forward_context import get_forward_context
@@ -299,16 +309,14 @@ def dbo_moe_finalize_allgather(
 
 
 @dbo_moe_finalize_allgather.register_fake
-def _(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Fake impl — FlashComm1 reduce_scatter shrinks dim 0."""
-    print("dbo_moe_finalize_allgather FAKE: in=%s sp=%s tp=%s", hidden_states.shape, _safe_sp_enabled(), _safe_tp_size())
-    if _safe_sp_enabled():
-        tp = _safe_tp_size()
-        return torch.empty(
-            (hidden_states.shape[0] // tp, *hidden_states.shape[1:]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+def _(
+    hidden_states: torch.Tensor,
+    flash_comm_enabled: bool,
+    tp_size: int,
+) -> torch.Tensor:
+    """Fake impl — explicit metadata mirrors pad plus reduce-scatter."""
+    if flash_comm_enabled:
+        return _fake_reduce_scatter_dim0(hidden_states, tp_size)
     return torch.empty_like(hidden_states)
 
 
@@ -321,6 +329,9 @@ def dbo_mla_preprocess(
     q_c: torch.Tensor,
     kv_no_split: torch.Tensor,
     need_gather_q_kv: bool,
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Real impl — DBO-aware MLA preprocess AllGather."""
     from vllm.forward_context import get_forward_context
@@ -353,18 +364,15 @@ def _(
     q_c: torch.Tensor,
     kv_no_split: torch.Tensor,
     need_gather_q_kv: bool,
+    flash_comm_enabled: bool,
+    tp_size: int,
+    output_num_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake impl — FlashComm1 AllGather expands dim 0."""
-    print("dbo_mla_preprocess FAKE: qc=%s kv=%s ng=%s sp=%s tp=%s", q_c.shape, kv_no_split.shape, need_gather_q_kv, _safe_sp_enabled(), _safe_tp_size())
-    if _safe_sp_enabled() and need_gather_q_kv:
-        tp = _safe_tp_size()
+    """Fake impl — explicit metadata mirrors all-gather plus unpad."""
+    if flash_comm_enabled and need_gather_q_kv:
         return (
-            torch.empty((q_c.shape[0] * tp, *q_c.shape[1:]), device=q_c.device, dtype=q_c.dtype),
-            torch.empty(
-                (kv_no_split.shape[0] * tp, *kv_no_split.shape[1:]),
-                device=kv_no_split.device,
-                dtype=kv_no_split.dtype,
-            ),
+            _fake_empty_dim0(q_c, output_num_tokens),
+            _fake_empty_dim0(kv_no_split, output_num_tokens),
         )
     return torch.empty_like(q_c), torch.empty_like(kv_no_split)
 

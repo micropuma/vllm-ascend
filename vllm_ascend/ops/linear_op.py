@@ -199,7 +199,9 @@ class MLPColumnParallelOp(CustomColumnParallelOp):
         bias = self.bias if not self.skip_bias_add else None
         # Matrix multiply.
         assert self.quant_method is not None
-        input_parallel = torch.ops.vllm_ascend.dbo_column_allgather_mlp.default(input_)
+        input_parallel = torch.ops.vllm_ascend.dbo_column_allgather_mlp.default(
+            input_, self.tp_size,
+        )
         output = self.quant_method.apply(self.layer, input_parallel, bias)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -439,8 +441,21 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         assert self.quant_method is not None
         need_all_gather = not (extract_layer_index(self.layer.prefix) == 0 and is_vl_model() and "attn" in self.prefix)
 
-        # DBO dispatch + communication via compile-safe custom op
-        input_ = torch.ops.vllm_ascend.dbo_column_allgather_sp.default(input_, need_all_gather)
+        # DBO dispatch + communication via compile-safe custom op.
+        # Shape metadata is explicit so fake impls do not read runtime context.
+        flash_comm_enabled = _EXTRA_CTX.flash_comm_v1_enabled
+        output_num_tokens = (
+            _EXTRA_CTX.num_tokens
+            if flash_comm_enabled and need_all_gather
+            else 0
+        )
+        input_ = torch.ops.vllm_ascend.dbo_column_allgather_sp.default(
+            input_,
+            need_all_gather,
+            flash_comm_enabled,
+            self.tp_size,
+            output_num_tokens,
+        )
 
         output_parallel = self.quant_method.apply(self.layer, input_, bias)
 

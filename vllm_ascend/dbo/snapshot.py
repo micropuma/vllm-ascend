@@ -16,3 +16,7 @@ _FLASH_COMM_V1_SNAPSHOT: bool = False
 def set_flash_comm_v1_snapshot(value: bool) -> None:
     global _FLASH_COMM_V1_SNAPSHOT
     _FLASH_COMM_V1_SNAPSHOT = value
+
+
+def get_flash_comm_v1_snapshot() -> bool:
+    return _FLASH_COMM_V1_SNAPSHOT
