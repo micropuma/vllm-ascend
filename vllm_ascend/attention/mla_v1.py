@@ -1807,7 +1807,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             max_size=MAX_O_PROJ_PREFETCH_SIZE,
             linear_layer=self.o_proj,
         )
-        output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        o_proj_output = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        # Sequence-parallel collectives may pad an odd token count to make it
+        # divisible by TP. Keep the MLA output contract at the logical ubatch
+        # length for eager, compiled, and graph execution alike.
+        output[...] = o_proj_output[:output.shape[0]]
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
