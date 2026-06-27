@@ -175,11 +175,15 @@ def _maybe_unpad_after_all_gather_fake(
     return torch.empty((unpadded_length, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
 
+def _get_reduce_scatter_num_tokens(num_tokens: int, tp_size: int) -> int:
+    return (num_tokens + tp_size - 1) // tp_size
+
+
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
     if (_FLASH_COMM_V1_SNAPSHOT or enable_sp_by_pass()) and do_comm:
-        return torch.empty(
-            (x.shape[0] // get_tensor_model_parallel_world_size(), *x.shape[1:]), device=x.device, dtype=x.dtype
-        )
+        tp_size = get_tensor_model_parallel_world_size()
+        num_tokens = _get_reduce_scatter_num_tokens(x.shape[0], tp_size)
+        return torch.empty((num_tokens, *x.shape[1:]), device=x.device, dtype=x.dtype)
 
     return x
 
@@ -268,8 +272,8 @@ def _matmul_and_reduce_impl_fake(input_parallel: torch.Tensor, layer_name: str) 
     forward_context = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     num_tokens = input_parallel.size(0)
-    if _EXTRA_CTX.flash_comm_v1_enabled:
-        num_tokens = num_tokens // self.tp_size
+    if _FLASH_COMM_V1_SNAPSHOT:
+        num_tokens = _get_reduce_scatter_num_tokens(num_tokens, self.tp_size)
     output = torch.empty(
         size=(num_tokens, self.output_size_per_partition), device=input_parallel.device, dtype=input_parallel.dtype
     )

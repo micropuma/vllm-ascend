@@ -207,6 +207,16 @@ def set_ascend_forward_context(
             pass
 
 
+def _get_ubatch_num_tokens(attn_metadata: Any, fallback_num_tokens: int) -> int:
+    """Return logical tokens for one ubatch, excluding scheduler padding."""
+    metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
+    for metadata in metadata_values:
+        num_actual_tokens = getattr(metadata, "num_actual_tokens", None)
+        if num_actual_tokens is not None:
+            return num_actual_tokens
+    return fallback_num_tokens
+
+
 def create_ascend_forward_context(
     cur_forward_context: Any,
     attn_metadata: Any,
@@ -251,7 +261,12 @@ def create_ascend_forward_context(
 
     new_forward_context.flash_comm_v1_enabled = cur_forward_context.flash_comm_v1_enabled
 
-    new_forward_context.num_tokens = ubatch_slices[ubatch_num].num_tokens
+    # UBatchSlice can include scheduler/graph padding. Communication padding
+    # must be derived from logical tokens, otherwise odd ubatches can use a
+    # different shape contract from their attention metadata.
+    new_forward_context.num_tokens = _get_ubatch_num_tokens(
+        attn_metadata, ubatch_slices[ubatch_num].num_tokens
+    )
 
     tp_world_size = get_tensor_model_parallel_world_size()
     dp_world_size = get_dp_group().world_size
@@ -311,7 +326,8 @@ def create_ascend_forward_context(
     from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla, get_cos_and_sin_slice, update_cos_sin
 
     if ubatch_slices and ubatch_slices[ubatch_num]:
-        token_slice = ubatch_slices[ubatch_num].token_slice
+        padded_token_slice = ubatch_slices[ubatch_num].token_slice
+        token_slice = slice(padded_token_slice.start, padded_token_slice.start + new_forward_context.num_tokens)
         positions = positions[: ubatch_slices[0].num_tokens + ubatch_slices[1].num_tokens]
 
         update_cos_sin(positions)
