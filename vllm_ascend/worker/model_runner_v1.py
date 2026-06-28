@@ -2894,12 +2894,27 @@ class NPUModelRunner(GPUModelRunner):
                 assert batch_descriptor.num_tokens == num_tokens_padded
 
         should_ubatch = check_enable_ubatch(
-            num_tokens_padded,
+            num_tokens,
             num_tokens_padded,
             uniform_decode=False,
             vllm_config=self.vllm_config,
             moe_comm_type=select_moe_comm_method(num_tokens_padded, self.vllm_config),
         )
+        if (
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.enable_dbo
+            and not should_skip_allreduce_across_dp_group(self.vllm_config, False)
+        ):
+            device, group = (
+                ("npu", get_dp_group().device_group)
+                if self.ascend_config.dp_allreduce_on_npu
+                else ("cpu", get_dp_group().cpu_group)
+            )
+            ubatch_flag = torch.tensor(
+                [int(should_ubatch)], device=device, dtype=torch.int32
+            )
+            dist.all_reduce(ubatch_flag, op=dist.ReduceOp.MIN, group=group)
+            should_ubatch = bool(ubatch_flag.item())
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -3347,7 +3362,7 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens,
@@ -3387,8 +3402,13 @@ class NPUModelRunner(GPUModelRunner):
             # pad is needed if the pad of `num_tokens` is triggered inside CudagraphDispatcher
             num_tokens_across_dp[:] = num_tokens_padded
             num_scheduled_tokens = num_scheduled_tokens.repeat(num_reqs_padded)
-        # vllm-ascend does not support ubatch now
-        ubatch_slices, ubatch_slices_padded = None, None
+        ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+            should_ubatch,
+            num_scheduled_tokens,
+            num_tokens_padded,
+            num_reqs_padded,
+            self.parallel_config.num_ubatches,
+        )
         attn_metadata: PerLayerAttnMetadata | None = None
         # Build attention metadata for dummy_run
         if self._should_build_dummy_attn_metadata(force_attention, is_profile, cudagraph_runtime_mode):
@@ -3527,6 +3547,11 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
+                ubatch_slices=(
+                    ubatch_slices_padded
+                    if cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    else ubatch_slices
+                ),
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
