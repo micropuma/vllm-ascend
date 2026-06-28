@@ -207,8 +207,17 @@ def set_ascend_forward_context(
             pass
 
 
-def _get_ubatch_num_tokens(attn_metadata: Any, fallback_num_tokens: int) -> int:
-    """Return logical tokens for one ubatch, excluding scheduler padding."""
+def _get_actual_num_tokens(attn_metadata: Any, fallback_num_tokens: int) -> int:
+    """Return the actual (logical) token count from attn_metadata, excluding scheduler/graph padding.
+
+    UBatchSlice.num_tokens can include scheduler padding added for TP alignment.
+    The attention metadata's num_actual_tokens always reflects the real token count.
+    Using the padded value for forward_context.num_tokens would cause pad_size to be
+    computed as 0, which defeats flashcomm's post-allgather unpad and creates shape
+    mismatches downstream (e.g. AddRmsNormBias tiling failures).
+    """
+    if attn_metadata is None:
+        return fallback_num_tokens
     metadata_values = attn_metadata.values() if isinstance(attn_metadata, dict) else (attn_metadata,)
     for metadata in metadata_values:
         num_actual_tokens = getattr(metadata, "num_actual_tokens", None)
@@ -261,10 +270,7 @@ def create_ascend_forward_context(
 
     new_forward_context.flash_comm_v1_enabled = cur_forward_context.flash_comm_v1_enabled
 
-    # UBatchSlice can include scheduler/graph padding. Communication padding
-    # must be derived from logical tokens, otherwise odd ubatches can use a
-    # different shape contract from their attention metadata.
-    new_forward_context.num_tokens = _get_ubatch_num_tokens(
+    new_forward_context.num_tokens = _get_actual_num_tokens(
         attn_metadata, ubatch_slices[ubatch_num].num_tokens
     )
 
