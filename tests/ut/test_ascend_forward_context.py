@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_ascend.ascend_forward_context import _get_ubatch_num_tokens
+from vllm_ascend.ascend_forward_context import _get_actual_num_tokens
 from vllm_ascend.ops.register_custom_ops import _get_reduce_scatter_num_tokens
 
 
@@ -15,8 +15,8 @@ from vllm_ascend.ops.register_custom_ops import _get_reduce_scatter_num_tokens
         ({}, 2051, 2051),
     ],
 )
-def test_get_ubatch_num_tokens(attn_metadata, fallback, expected):
-    assert _get_ubatch_num_tokens(attn_metadata, fallback) == expected
+def test_get_actual_num_tokens(attn_metadata, fallback, expected):
+    assert _get_actual_num_tokens(attn_metadata, fallback) == expected
 
 
 @pytest.mark.parametrize(
