@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 最小复现：DBO + FlashComm2 AICPU AllToAll 故障
