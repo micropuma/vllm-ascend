@@ -115,57 +115,153 @@ MoE 与 Attention 的总体思想相同：
 
 这里重点讨论一下 TP + DP + EP的all gather问题。 
 
-### flashcommv2做了什么？ 
+### flashcommv2做了什么？
 
-> 想要解决什么问题？  
+> 想要解决什么问题？
 
-传统TP通信，在O projection阶段会执行 `reduce scatter`通信。该通信是：（1）X是完整token维度，部分hidden dim维度（H/TP_SIZE）；（2）weight是（H/TP_SIZE）x H 维度。这种通信模式有其优劣：  
+回顾 FlashComm1 的链路：Attention 输出经过 o_proj（row-parallel）后，执行 TP **ReduceScatter** 沿 token 维切分结果，使每个 rank 只保留 `T/TP` 个 token 的完整 hidden state。这种通信模式有其优劣：
 
-* 优势：weight每卡只用存储 H/TP_SIZE X H，大大减少了存储量  
-* 劣势：最后做的通信，通信量很大：H X H   
+* 优势：下游的 RMSNorm、per-token quant 等操作只需在本地 token shard 上执行，避免 TP 间冗余计算。
+* 劣势：o_proj 的 ReduceScatter 通信量 = `T * H_out`（每个 rank 都产出完整 [T, H_out] 的 partial 结果，RS 阶段需要先 sum 再 scatter）。
 
-> FlashCommv2 怎么做的？  
+此外，在 DP > 1 的场景下，o_proj 之后的 token 仍按 DP 维度分布，后续 MoE 需要先 DP AllGather 再 EP 分发，通信链路长。
 
-首先先用一句话概括：对于attention的输出做 AllToAll 把 head 维切分转换成 sequence 维切分，使得后续O projection 从 TP 计算转成 DP 计算。其逻辑链条如下：  
+> FlashCommv2 的核心思路
 
-* 先对 Attention 输出做 all to all        
-   * 原来每张卡持有：所有 token × 部分 head   
-   * 现在每张卡持有：部分 token × 所有 head       
-具体过程如下：  
-        ```shell
-        1. 每张卡把自己的 T 个 token 切成 P 份；
-        2. 第 j 份 token 发给第 j 张卡；
-        3. 每张卡收到同一批 token 在所有 TP rank 上的 head 分片；
-        4. 沿 head 维拼接。
-        ```
-* 优势：通信迁移，并且只用传输 (H / TP) x H。  
-* 劣势：weight矩阵给是完整的。  
+一句话概括：在 ODP group（output-data-parallel，跨 DP 维度）内做 AllToAll，把 Attention 的 **head 维切分** 转换为 **sequence 维切分**，从而将 o_proj 从"TP 计算 + 大通信"转为"DP 计算 + 小通信"，并通过扩展 weight 输入维度消除 ODP 维度对应的输出规约。
 
-一个总结对比图：  
+实现上，FlashComm2 将全局 TP 拆成两级通信组（以 TP=8, otp=4 为例）：
 
-```shell
-传统：
-[T, 2048]
-   ↓ 局部 o_proj
-[T, 7168]
-   ↓ ReduceScatter
-[T/8, 7168]
+```
+全局 TP=8 拆分为：OTP size=4, ODP size=2
 
-FlashComm2：
-[T, 2048]
-   ↓ AllToAll
-[T/8, 16384]
-   ↓ 完整 o_proj
-[T/8, 7168]
+OTP (Output Tensor Parallel) = interleaved grouping:
+  Group 0: {rank0, rank2, rank4, rank6}
+  Group 1: {rank1, rank3, rank5, rank7}
+
+ODP (Output Data Parallel) = contiguous grouping:
+  Group 0: {rank0, rank1}
+  Group 1: {rank2, rank3}
+  Group 2: {rank4, rank5}
+  Group 3: {rank6, rank7}
 ```
 
-> 多节点情况下怎么弄？  
+关键性质：OTP 和 ODP 是正交的（crossed），同一个 OTP group 内的 rank 分布在不同的 ODP group 中。
 
-对于大模型而言，flashcomm2会显著增加存储量。所以如果集群很大，可以按照如下配置方案：  
+> 完整数据流（对照 linear_op.py:315-410）
 
-将跨节点的 All2All替换成节点内All2All和一次矩阵乘后的跨节点ReduceScatter操作。该方法将Output 投影矩阵计算由TP $N$转化为DP8+TP $N/8$，而非节点间All2All的技术的DP $N$，其中$N$为节点数。此方法相比于节点间All2All的技术，显著减少了单卡所需载入的权重，且以节点间两卡ReduceScatter的操作替换了原跨节点All2All操作。
+```shell
+输入 X: [T, H_h/TP]
+每个 rank 已有 sequence-parallel 布局（FC1 的产物）
+         │
+         ▼
+  [1] Pad 到 TP 对齐: [T+pad, H_h/TP]
+         │
+         ▼
+  [2] Batch 重排 (group_indices)
+  将 token 按 OTP group 归类，确保后续 AllToAll 后
+  同 OTP group 的 token 在一起
+         │
+         ▼
+  [3] ODP AllToAll (跨 odp_size 个 rank)
+  在 ODP group 内交换 token → 汇总 head 维度
+  结果: [T/odp, odp * H_h/TP]
+         │
+         ▼
+  [4] o_proj MatMul
+  Weight: [odp * H_h/TP, H_out/otp]
+  输出: [T/odp, H_out/otp]
+         │                              ← 这里输出的 H_out/otp
+         ▼                                只是部分 hidden dim
+  [5] OTP ReduceScatter (dim=0)
+  在 OTP group 内沿 token 维归约
+  结果: [T/odp/otp, H_out/otp]
+         │
+         ▼
+  [6] 可选 TP AllGather
+  ─ 如果 FlashComm1 已启用 → 跳过
+  ─ 如果 FlashComm1 未启用 → 执行全局 AllGather
+         │
+         ▼
+  输出 Y: [T/TP, H_out/otp]
+```
 
-> 总结：（1）以存换传（2）TP计算 转成 DP计算
+与代码的对应关系（`vllm_ascend/ops/linear_op.py`）：
+
+| 步骤 | 代码行 | 说明 |
+|------|--------|------|
+| Padding | L327-329 | `F.pad(input_parallel, (0, 0, 0, num_padding_tokens))` |
+| 重排 | L341 | `chunked = chunked[self.group_indices]` |
+| ODP AllToAll | L355 | `dist.all_to_all_single(recv_buf, send_buf, group=self.odp_group.device_group)` |
+| MatMul | L375 | `self.quant_method.apply(self.layer, input_parallel, bias=bias_)` |
+| OTP ReduceScatter | L379 | `self.comm_group.reduce_scatter(output_parallel, dim=0)` |
+| TP AllGather | L383 | `get_tp_group().all_gather(output, 0)` — 仅 FC1 未启用时执行 |
+
+> FlashComm2 vs 标准 TP vs 普通 OTP 的通信对比
+
+以 TP=8, otp=4, odp=2 为例，设单 rank o_proj 输出张量大小 = `T * H_out/8`：
+
+| 方案 | 通信操作 | 通信组大小 | 特点 |
+|------|----------|-----------|------|
+| 标准 TP | AllReduce | 8-rank | 一次全局 AllReduce（内部 = RS + AG） |
+| 普通 OTP (OProjRowParallelOp) | AllToAll + ReduceScatter | 均在 OTP group 内 | OTP 组内通信，不涉及 ODP |
+| **FlashComm2** | **ODP AllToAll + OTP RS + (可选 TP AG)** | ODP=2, OTP=4 | 两级小组合通信 |
+
+> FlashComm2 的 4 个核心优势
+
+**优势 1 (最关键)：配合 FlashComm1 消除全局 AllGather**
+
+当 FlashComm1 启用时，`linear_op.py:401-405` 中 **TP AllGather 被直接跳过**。输出保持 `[T/TP, H]` 的 sequence-parallel 布局向下传递。
+
+```python
+# linear_op.py:401-405
+if not _EXTRA_CTX.flash_comm_v1_enabled:
+    output = get_tp_group().all_gather(output, 0)  # ← FC1 启用时跳过！
+```
+
+这意味着 FlashComm2 的实际通信只有 ODP AllToAll + OTP ReduceScatter，两个操作都在 **更小的子组** 内完成。相比标准 TP 需要一次全局 AllReduce（8 个 rank 参与），FlashComm2 的两级通信参与 rank 数分别为 2 和 4，对 HCCL/NIC 的争抢小得多，通信拓扑更优。
+
+**优势 2：W8A8 量化让 AllToAll 通信量减半**
+
+当启用 W8A8 量化时（`w8a8_static.py:90-108`），ODP AllToAll 传输的是 int8 量化后的数据，而不是 fp16：
+
+```python
+# w8a8_static.py:90-108
+quant_x = torch.ops.vllm.quantize(x, ...)  # fp16 → int8, 大小减半
+x = comm_fn(comm_input)                     # AllToAll 传的是 int8
+```
+
+相比标准 TP 的 AllReduce 无法做这种量化+通信融合（AllReduce 需要 float32 做归约），FlashComm2 的 AllToAll 是 pure data movement，天然可以传量化数据，**直接节省 50% 的 ODP 通信带宽**。
+
+**优势 3：小组合通信拓扑更优**
+
+标准 TP AllReduce 横跨所有 8 个 rank，NCCL ring 跳数长、带宽利用不充分。FlashComm2 拆成：
+- ODP AllToAll（2 个 rank）：ring 只有 2 跳
+- OTP ReduceScatter（4 个 rank）：ring 只有 4 跳
+
+小组合通信的总开销（启动延迟 × 跳数）显著低于一次大组 AllReduce。这在 Ascend HCCL 上尤其明显。
+
+**优势 4：支持 Weight O-Shard 显存优化**
+
+FlashComm2 配合 `layer_sharding=["o_proj"]` 时（见 `flashcomm2_oshard_manager.py`），o_proj 权重可以在 rank 间分片存储、按层异步 broadcast 加载，减少单卡显存占用。每张卡只需常驻 `1/otp` 的 o_proj 权重。
+
+> 代价："以存换传"的本质
+
+FlashComm2 的 weight 输入维度从 `H_h/TP` 扩展为 `odp * H_h/TP`，即扩大了 odp 倍。但注意：
+- 全局 weight 总量不变：`(odp * H_h/TP) * (H_out/otp) = H_h * H_out / TP`（与传统 TP 相同）
+- 只是同一 rank 需要加载的 weight 列数增多（输入维扩大），输出维减少（H_out/otp vs H_out/TP）
+- 真正的额外存储被 O-Shard 机制分担
+
+> 总结
+
+| 维度 | 标准 TP | FlashComm2 |
+|------|---------|------------|
+| 通信模式 | AllReduce (8-rank) | ODP AllToAll (2-rank) + OTP RS (4-rank) |
+| FC1 集成 | 与 FC1 无耦合 | FC1 启用时跳过 TP AllGather |
+| 量化融合 | 不支持 | W8A8 让 AllToAll 传 int8 |
+| 通信拓扑 | 大组 (8-rank ring) | 小组 (2-rank/4-rank ring) |
+| Weight 存储 | H_h/TP × H_out/TP | odp×H_h/TP × H_out/otp (O-Shard 可分担) |
+| 本质 | TP 计算 + TP 通信 | DP 计算 + 小组合通信 |
 
 #### O Shard优化  
 
