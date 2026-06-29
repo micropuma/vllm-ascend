@@ -2900,11 +2900,14 @@ class NPUModelRunner(GPUModelRunner):
             vllm_config=self.vllm_config,
             moe_comm_type=select_moe_comm_method(num_tokens_padded, self.vllm_config),
         )
+
+        # dp情况下开启dbo，要求每个rank都同时should ubatch，才开启dbo
         if (
             self.parallel_config.data_parallel_size > 1
             and self.parallel_config.enable_dbo
             and not should_skip_allreduce_across_dp_group(self.vllm_config, False)
         ):
+            # 默认用gloo做cpu side all reduce，回退用npu side all reduce
             device, group = (
                 ("npu", get_dp_group().device_group)
                 if self.ascend_config.dp_allreduce_on_npu

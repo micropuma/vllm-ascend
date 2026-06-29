@@ -1259,8 +1259,10 @@ def get_flashcomm2_reorgnized_batch_ids(global_tp_size) -> list[list[int]]:
     num_oproj_tensor_parallel_groups: int = global_tp_size // flashcomm2_otp_size
 
     reorgnized_batch_ids = []
+    # dp group
     for i in range(num_oproj_tensor_parallel_groups):
         ranks = []
+        # tp group
         for j in range(flashcomm2_otp_size):
             rank_idx = i + j * num_oproj_tensor_parallel_groups
             ranks.append(rank_idx)

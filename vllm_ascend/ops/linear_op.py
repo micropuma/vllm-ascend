@@ -329,31 +329,49 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
             input_parallel = nn.functional.pad(input_parallel, (0, 0, 0, num_padding_tokens))
 
         def otp_maybe_quant_comm(x):
-            # Reorganize the tensor so that the batch id and rank id correspond to each other.
+            # x shape: [padded_bs, D]  where D = headnum * headdim / TP (= input_size_per_partition)
+            #
+            # Example: TP=4, flashcomm2_otp_size=2
+            #   reorgnized_batch_ids = [[0,2],[1,3]], odp_size=2, otp_size=2
+            #
+            # Step A: 将 padded_bs 切成 chunk_num 份，按 group_indices 重排
+            #   chunk_num = num_otp_groups * otp_size = (TP/otp_size) * otp_size = TP = 4
             chunk_num = len(self.reorgnized_batch_ids) * len(self.reorgnized_batch_ids[0])
+
             batch_size = x.size(0)
+            assert batch_size % chunk_num == 0, (
+                f"Batch_size({batch_size}) must be divisible by chunk_num({chunk_num})"
+            )
 
-            assert batch_size % chunk_num == 0, f"Batch_size({batch_size}) must be divisible by chunk_num({chunk_num})"
-
-            batch_size_per_chunk = batch_size // chunk_num
-            # Indices of reorganized tensor
+            batch_size_per_chunk = batch_size // chunk_num  # = padded_bs / TP
+            # chunked: [TP, padded_bs/TP, D]
             chunked = x.view(chunk_num, batch_size_per_chunk, x.shape[1])
             if self.otp_size != 1:
+                # group_indices e.g. [0,2,1,3]: 把同 OTP group 的 chunk 靠在一起
+                #   重排前: [c0(OTP0), c1(OTP1), c2(OTP0), c3(OTP1)]
+                #   重排后: [c0(OTP0), c2(OTP0), c1(OTP1), c3(OTP1)]
+                # chunked shape 不变: [TP, padded_bs/TP, D]
                 chunked = chunked[self.group_indices]
+            # send_buf: [TP, padded_bs/TP * D]
             send_buf = chunked.flatten(1, 2)
 
-            # all-to-all operation parameters
-            all2all_tp_size = self.odp_size
-            local_intermediate_size = x.size(1)
-            chunk_size = x.size(0) // all2all_tp_size
-            total_intermediate_size = local_intermediate_size * all2all_tp_size
+            # Step B: ODP all-to-all — 跨 ODP group 交换 chunk
+            #   send_buf[TP, padded_bs/TP * D] 被等分 odp_size 份发出去
+            all2all_tp_size = self.odp_size               # = odp_size
+            local_intermediate_size = x.size(1)            # = D
+            chunk_size = x.size(0) // all2all_tp_size      # = padded_bs / odp_size
+            total_intermediate_size = local_intermediate_size * all2all_tp_size  # = D * odp_size
 
-            # Create receive buffer
+            # recv_buf: [D * odp_size * padded_bs/odp_size] = [D * padded_bs]  (1D flat)
             recv_buf = torch.empty(total_intermediate_size * chunk_size, dtype=x.dtype, device=x.device)
 
-            # Perform all-to-all communication
+            # all-to-all: each rank sends chunk_num/odp_size rows to each odp peer
+            # 注意只有 odp group参与all to all
             dist.all_to_all_single(recv_buf, send_buf, group=self.odp_group.device_group)
 
+            # Step C: 重整 recv_buf → [padded_bs/odp_size, odp_size * D]
+            #   view(odp_size, padded_bs/odp_size, D).transpose(0,1).reshape(padded_bs/odp_size, odp_size*D)
+            #   从其他dp拿到数据，hiddendim按照 dp_size 做拼接
             return recv_buf.view(all2all_tp_size, chunk_size, -1).transpose(0, 1).reshape(chunk_size, -1)
 
         if not hasattr(self, "_quant_comm_config"):
@@ -361,6 +379,13 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         self.layer._quant_comm_config["communication_fn"] = otp_maybe_quant_comm
         actual_quant_method = getattr(self.quant_method, "quant_method", self.quant_method)
         from vllm_ascend.quantization.methods.w8a8_static import AscendW8A8LinearMethod
+
+        # DBO hook: must cover the full communication block (ODP AllToAll + matmul +
+        # OTP/TP ReduceScatter + optional TP AllGather) so that DBO can enforce a
+        # consistent collective submission order across ubatch threads on two NPU streams.
+        forward_context = get_forward_context()
+        if forward_context.dbo_enabled:
+            _dbo_call_linear_row_hook(forward_context, is_record=True)
 
         if not isinstance(actual_quant_method, AscendW8A8LinearMethod):
             # Check if w8a8 quantization is enabled. If not, communicate immediately.
@@ -385,6 +410,9 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
             output = get_tp_group().all_gather(output, 0)
             if num_padding_tokens > 0:
                 output = output[:-num_padding_tokens]
+
+        if forward_context.dbo_enabled:
+            _dbo_call_linear_row_hook(forward_context, is_record=False)
 
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None

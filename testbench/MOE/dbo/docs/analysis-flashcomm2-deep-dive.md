@@ -486,51 +486,343 @@ elif ("o_proj" in layer.prefix or "out_proj" in layer.prefix) \
 
 ## 7. O-Shard Weight 分片（可选增强）
 
-### 7.1 Flashcomm2OShardManager
+### 7.1 O-Shard 原理概述
+
+O-Shard 是 FlashComm2 配套的显存优化方案，核心思路是**将 Attention O-Proj weight 分散到多张卡存储，通过异步 broadcast 按需加载**。
+
+**启用条件**（两个同时满足）：
+- `flashcomm2_enable()` = True → `VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE > 0`
+- `o_shard_enable()` = True → `layer_sharding` 包含 `"o_proj"` — [`vllm_ascend/utils.py:1196-1200`](../../../../vllm_ascend/utils.py#L1196)
+
+```python
+def o_shard_enable() -> bool:
+    layer_sharding = get_ascend_config().layer_sharding
+    if layer_sharding is None:
+        return False
+    return "o_proj" in layer_sharding
+```
+
+### 7.2 Weight 分片存储策略
+
+> [`vllm_ascend/ops/layer_shard_linear.py:18-56`](../../../../vllm_ascend/ops/layer_shard_linear.py#L18)
+
+**关键数据结构**：
+
+```python
+@dataclass
+class SeriesMetadata:
+    """Weight shard series 的元数据"""
+    group: GroupCoordinator              # shard_weight_group（即 TP group）
+    start_layer: int                     # 系列的起始层索引
+    end_layer: int                       # 系列的结束层索引
+    num_layers: int                      # 该系列包含的总层数
+    prefetch_step: int                   # 预取步数（通常=1）
+    dummy_weight: torch.Tensor           # 临时占位符 weight
+    layers: list[LayerMetadata]          # 所有注册的层对象
+    shard_windows: list[ShardWindowMetadata]  # 环形缓冲（大小 = prefetch_step + 1）
+    window_offset: int                   # 下一个待使用的 window 索引
+
+    def is_source(self, layer_idx) -> bool:
+        # 该层的 weight 是否存储在当前 rank 上
+        return layer_idx % self.group.world_size == self.group.rank_in_group
+```
+
+**分片规则**：层 `i` 的 weight 存储在 rank `(i % TP_size)` 上。
+
+例如 TP=4、o_proj 的 4 层分布：
+```
+layer 0 → rank 0（owner）    layer 1 → rank 1（owner）
+layer 2 → rank 2（owner）    layer 3 → rank 3（owner）
+```
+
+每个 rank 只存储自己负责的 layer weight，其他层的 weight 通过按需 broadcast 获取。
+
+### 7.3 环形缓冲与 Prefetch 机制
+
+> [`vllm_ascend/ops/layer_shard_linear.py:57-114`](../../../../vllm_ascend/ops/layer_shard_linear.py#L57)
+
+**初始化过程** — `post_process_after_loading()`：
+
+```
+Step 1: 排序所有注册的层
+        layers.sort(key=lambda x: x.layer_idx)
+
+Step 2: 对每一层执行 broadcast
+        for layer_idx in range(start_layer, end_layer):
+            is_source = (layer_idx % group_size == rank_in_group)
+            if is_source:
+                # 该层的 owner rank：直接使用本地 weight
+            else:
+                # 其他 rank：创建空 tensor 接收 broadcast
+                layer.weight.set_(torch.empty_like(dummy_weight))
+
+            dist.broadcast(layer.weight, src=source_rank, group=shard_group)
+            layer.quant_method.process_weights_after_loading()
+
+Step 3: 建立 shard_windows（环形缓冲）
+        缓冲大小 = prefetch_step + 1（通常=2）
+
+        前 prefetch_step 层（0 到 prefetch_step-1）:
+            ├─ 创建 window，clone weight
+            └─ 非源 rank：让 layer.weight 指向该 window
+
+        第 prefetch_step 层:
+            ├─ 创建 empty window（用于异步加载下一层）
+            └─ 非源 rank：dispose 原 weight（释放显存）
+
+Step 4: dispose dummy_weight
+```
+
+**Prefetch 流程** — `reach_layer(layer_idx)` 在 forward 中被调用：
+
+```python
+def reach_layer(self, layer_idx: int):
+    # 计算待预取的下一层
+    next_layer_idx = (layer_idx - self.start_layer + self.prefetch_step) % self.num_layers + self.start_layer
+    next_window = self.shard_windows[self.window_offset]
+
+    # 源 rank 拷贝 weight 到 next_window
+    if self.is_source(next_layer_idx):
+        next_window.weight.copy_(self.layers[next_layer_idx - self.start_layer].weight)
+
+    # 异步 broadcast
+    work = dist.broadcast(
+        next_window.weight,
+        src=self.group.ranks[next_layer_idx % self.group.world_size],
+        group=self.group.device_group,
+        async_op=True  # 异步执行
+    )
+
+    next_window.work = work
+    next_window.data_layer_idx = next_layer_idx
+    self.window_offset = (self.window_offset + 1) % len(self.shard_windows)
+```
+
+**等待 Weight 就绪** — `wait_weight(layer_idx)` 在 layer.forward 前被调用：
+
+```python
+def wait_weight(self, layer_idx: int):
+    window_idx = (layer_idx - self.start_layer) % len(self.shard_windows)
+    window = self.shard_windows[window_idx]
+
+    # 等待异步 broadcast 完成
+    if window.work is not None:
+        window.work.wait()
+        window.work = None
+```
+
+**时间线示例**（prefetch_step=1，TP=4）：
+
+```
+t=0: forward(layer_0)
+     ├─ wait_weight(layer_0) → window[0] 已就绪
+     ├─ layer_0.forward()
+     └─ reach_layer(layer_0)  [在 QKV forward 时调用]
+        └─ 异步加载 layer_1 weight 到 window[1]
+
+t=1: forward(layer_1)
+     ├─ wait_weight(layer_1) → 等待 window[1] broadcast 完成
+     ├─ layer_1.forward()
+     └─ reach_layer(layer_1)
+        └─ 异步加载 layer_2 weight 到 window[0]（轮转覆盖）
+
+t=2: forward(layer_2)
+     ├─ wait_weight(layer_2) → 等待 window[0] broadcast 完成
+     └─ ...
+```
+
+### 7.4 集成架构
+
+#### 7.4.1 Flashcomm2OShardManager（顶层 Wrapper）
 
 > [`vllm_ascend/ops/flashcomm2_oshard_manager.py:15-101`](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L15)
 
-当同时启用 `flashcomm2_enable()` 和 `o_shard_enable()`（即 `layer_sharding` 包含 `"o_proj"`）时，O-Proj weight 在 rank 间分片，通过 shard weight group 做异步 broadcast 按需加载。
-
 ```python
 class Flashcomm2OShardManager:
-    # [L34-35](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L34)
+    def __init__(self):
+        self._shard_layers: dict[int, Any] = {}  # layer_idx → layer object
+
     def flashcomm2_oshard_enable(self):
         return flashcomm2_enable() and o_shard_enable()
 
-    # [L37-59](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L37)
-    def register_layer(self, layer, prefetch_step=1):
-        # 由 Flashcomm2OProjRowParallelOp.update_attrs() 调用 — [L398-399](../../../../vllm_ascend/ops/linear_op.py#L398)
-        ...
+    def register_layer(self, layer: Any, prefetch_step: int = 1):
+        """在模型初始化时被 Flashcomm2OProjRowParallelOp.update_attrs() 调用"""
+        if is_hidden_layer(layer):
+            layer_idx = extract_layer_index(layer.prefix)
+            self._shard_layers[layer_idx] = layer
 
-    # [L72-88](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L72)
-    def trigger_broadcast_for_layer(self, layer_prefix):
-        # 由 Flashcomm2OshardQKVParallelOp 在 forward 时调用
-        ...
+            register_layer_to_shard_weight_series(
+                series_name="o_proj",
+                group=get_shard_weight_group(),
+                layer=layer,
+                prefetch_step=prefetch_step
+            )
 
-    # [L90-98](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L90)
+    def trigger_broadcast_for_layer(self, layer_prefix: str):
+        """在 forward 时被 Flashcomm2OshardQKVParallelOp.apply_impl() 调用"""
+        layer_idx = extract_layer_index(layer_prefix)
+        target_layer = self.get_layer(layer_idx)
+
+        if target_layer and is_hidden_layer(target_layer):
+            reach_layer_for_shard_weight_series(target_layer)
+
     def post_process_after_loading(self):
-        # 由 AttentionV1.process_weights_after_loading() 调用
-        ...
+        """在权重加载完成后被 AttentionV1.process_weights_after_loading() 调用"""
+        if self._shard_layers:
+            any_layer = next(iter(self._shard_layers.values()))
+            post_process_after_loading_for_shard_weight_series(any_layer)
+
+# 全局单例
+flashcomm2_oshard_manager = Flashcomm2OShardManager()
 ```
 
-### 7.2 O-Shard 完整调用链
+#### 7.4.2 集成入口 1：模型初始化
+
+> [`vllm_ascend/ops/linear_op.py:422-427`](../../../../vllm_ascend/ops/linear_op.py#L422)
+
+```python
+class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
+    def update_attrs(self):
+        super().update_attrs()
+        self.input_is_parallel = self.layer.input_is_parallel
+        self.input_size_per_partition = self.layer.input_size_per_partition
+
+        # 只有 FlashComm2 O-Proj Op 在初始化时注册层到 O-Shard manager
+        if flashcomm2_oshard_manager.flashcomm2_oshard_enable():
+            flashcomm2_oshard_manager.register_layer(self.layer, prefetch_step=1)
+```
+
+**关键点**：
+- 只有 `Flashcomm2OProjRowParallelOp` 会注册（普通 `OProjRowParallelOp` 不会）
+- 在 `CustomRowParallelOp.update_attrs()` 被模型初始化调用时触发
+- 每个 O-Proj layer 被注册到底层的 `layer_shard_linear` 的全局 series dict
+
+#### 7.4.3 集成入口 2：权重加载完成
+
+> 调用链：`AttentionV1.process_weights_after_loading()` → `flashcomm2_oshard_manager.post_process_after_loading()` → `post_process_after_loading_for_shard_weight_series()`
+
+初始化 shard_windows、执行所有 broadcast、建立 forward wrapper。
+
+#### 7.4.4 集成入口 3：前向传播（Prefetch 触发）
+
+> [`vllm_ascend/ops/linear_op.py:520-525`](../../../../vllm_ascend/ops/linear_op.py#L520)
+
+在 **Flashcomm2OshardQKVParallelOp.apply_impl()** 中触发：
+
+```python
+class Flashcomm2OshardQKVParallelOp(CustomColumnParallelOp):
+    def apply_impl(self, input_):
+        # ... QKV 计算 ...
+
+        # 在 matmul 前触发异步加载下一层（O-Proj）的 weight
+        flashcomm2_oshard_manager.trigger_broadcast_for_layer(self.layer.prefix)
+
+        output_parallel = self.quant_method.apply(self.layer, input_, bias)
+        # ...
+```
+
+**为什么在 QKV 这里触发**？
+- QKV forward 完成 → Attention 计算
+- Attention 完成后立即需要 O-Proj
+- 在 QKV 执行时异步加载 O-Proj weight，**overlap communication 和计算**
+
+#### 7.4.5 集成入口 4：Layer Forward 包装
+
+> [`vllm_ascend/ops/layer_shard_linear.py:162-168`](../../../../vllm_ascend/ops/layer_shard_linear.py#L162)
+
+```python
+def _create_forward_wrapper(forward: Callable, series: SeriesMetadata, layer_idx: int) -> Callable:
+    def wrapped_forward(*args, **kwargs):
+        # 在 forward 前等待 weight 加载完成
+        series.wait_weight(layer_idx)
+        return forward(*args, **kwargs)
+
+    return wrapped_forward
+
+# 在 register_layer_to_shard_weight_series 中被使用
+layer.forward = _create_forward_wrapper(layer.forward, series, layer_idx)
+```
+
+每个注册的 O-Proj layer 的 forward 都被包装，确保 weight 已就位。
+
+### 7.5 完整调用链与时间轴
 
 ```
-model init:
-  Flashcomm2OProjRowParallelOp.update_attrs()       — [L394-399](../../../../vllm_ascend/ops/linear_op.py#L394)
-    → flashcomm2_oshard_manager.register_layer()    — [L37](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L37)
-      → register_layer_to_shard_weight_series()
-
-forward pass:
-  Flashcomm2OshardQKVParallelOp.apply_impl()        — [L479-504](../../../../vllm_ascend/ops/linear_op.py#L479)
-    → flashcomm2_oshard_manager.trigger_broadcast_for_layer()  — [L72](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L72)
-      → reach_layer_for_shard_weight_series()
-
-post load:
-  AttentionV1.process_weights_after_loading()       — attention_v1.py
-    → flashcomm2_oshard_manager.post_process_after_loading()   — [L90](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L90)
+┌─ 配置阶段 ──────────────────────────────────────────────┐
+│  env: VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE=N            │
+│  env: VLLM_ASCEND_LAYER_SHARDING=[o_proj]               │
+│  → o_shard_enable() = True                              │
+└──────────────────────────────────────────────────────────┘
+         ↓
+┌─ 模型初始化阶段 ────────────────────────────────────────┐
+│  for each layer in model.layers:                         │
+│    if "o_proj" in layer.prefix:                          │
+│      Flashcomm2OProjRowParallelOp(layer).update_attrs()  │
+│        → flashcomm2_oshard_manager.register_layer()      │
+│          → register_layer_to_shard_weight_series()       │
+│            └─ 记录 layer metadata                        │
+│            └─ 非源 rank dispose weight                   │
+│            └─ 包装 layer.forward() with wait_weight()    │
+└──────────────────────────────────────────────────────────┘
+         ↓
+┌─ 权重加载完成后 ────────────────────────────────────────┐
+│  AttentionV1.process_weights_after_loading()             │
+│    → flashcomm2_oshard_manager.post_process_after_loading()
+│      → post_process_after_loading_for_shard_weight_series()
+│        ├─ Broadcast all O-Proj weights                  │
+│        ├─ 初始化 shard_windows（prefetch_step+1 个）    │
+│        └─ forward wrapper 已就位                        │
+└──────────────────────────────────────────────────────────┘
+         ↓
+┌─ 前向传播阶段（迭代 per token） ────────────────────────┐
+│  for each layer_idx in range(num_layers):                │
+│                                                           │
+│    t=k: Flashcomm2OshardQKVParallelOp[k].apply_impl()    │
+│        ├─ Attention QKV + matmul                         │
+│        └─ trigger_broadcast_for_layer(prefix[k])         │
+│          → reach_layer(o_proj[k+1])                      │
+│            └─ 异步加载 o_proj[k+1] weight 到 window     │
+│                                                           │
+│    t=k+1: Flashcomm2OProjRowParallelOp[k].apply_impl()   │
+│        ├─ wrapped_forward() 自动调用：                   │
+│        │  └─ wait_weight(k)                              │
+│        │    └─ 等待 t=k 的 broadcast 完成               │
+│        └─ O-Proj 本地 forward + 通信                    │
+└──────────────────────────────────────────────────────────┘
 ```
+
+### 7.6 与 FlashComm2 通信的协作
+
+O-Shard 本身**不参与 FlashComm2 的 ODP all-to-all 和 OTP reduce-scatter**，只负责 O-Proj weight 的按需加载。
+
+但两者配合工作流程：
+
+```
+Layer N Attention:
+  QKV forward (Flashcomm2OshardQKVParallelOp)
+  ├─ trigger_broadcast_for_layer(qkv[N]) → 异步加载 o_proj[N+1] weight
+  ├─ QKV matmul
+  └─ Attention 计算
+
+  O-Proj forward (Flashcomm2OProjRowParallelOp)
+  ├─ wait_weight(N) → 等待 o_proj[N] weight ready
+  ├─ ODP all-to-all（FlashComm2 通信）
+  ├─ O-Proj matmul
+  └─ OTP reduce-scatter（FlashComm2 通信）
+
+Layer N+1 Attention:
+  QKV forward (Flashcomm2OshardQKVParallelOp)
+  ├─ trigger_broadcast_for_layer(qkv[N+1]) → 异步加载 o_proj[N+2] weight
+  └─ （此时 o_proj[N+1] weight 已就绪）
+
+  O-Proj forward (Flashcomm2OProjRowParallelOp)
+  ├─ wait_weight(N+1) → 等待 o_proj[N+1] weight ready（通常已就绪）
+  └─ ...
+```
+
+**显存优化效果**：
+- 无 O-Shard：每张卡存储所有 O-Proj layer 的 weight（显存占用 = layers × weight_size）
+- 有 O-Shard：每张卡只存储 `num_layers / TP` 个 O-Proj layer weight + 2 个 window（显存占用 ≈ `(layers / TP) × weight_size`）
 
 ---
 
@@ -623,48 +915,304 @@ Layer N 的正常 DBO 流程 (A2):
 
 ---
 
-## 9. 调用链路总览
+## 8. O-Shard 与 DBO 的交互
 
-```
-模型 forward
-  └─ _get_row_parallel_op("o_proj", layer)           [linear_op.py:L694]
-       ├─ oproj_tp_enable() → OProjRowParallelOp      (有 DBO hook)
-       └─ flashcomm2_enable() → Flashcomm2OProjRowParallelOp  (无 DBO hook)
-            └─ apply_impl(input_)
-                 ├─ get_input_parallel(input_)          [linear_op.py:L324]
-                 ├─ pad input                           [linear_op.py:L327]
-                 ├─ otp_maybe_quant_comm(x):             [linear_op.py:L331]
-                 │    ├─ chunk + reorder (group_indices)  [linear_op.py:L341]
-                 │    ├─ all_to_all_single (ODP group)   [linear_op.py:L355]
-                 │    └─ reshape output
-                 ├─ W8A8 check: inject comm_fn or call  [linear_op.py:L359]
-                 ├─ quant_method.apply()                  [linear_op.py:L375]
-                 │    └─ (W8A8) → comm_fn inside quant   [w8a8_static.py:L90]
-                 ├─ reduce_scatter (OTP group)           [linear_op.py:L379]
-                 ├─ all_gather (TP group, if !FC1)       [linear_op.py:L383]
-                 └─ de-pad                                [linear_op.py:L387]
+### 8.1 O-Shard 中的 Forward Wrapper 不会额外触发 DBO Hook
+
+> [`vllm_ascend/ops/layer_shard_linear.py:162-168`](../../../../vllm_ascend/ops/layer_shard_linear.py#L162)
+
+O-Shard 的 forward wrapper 只负责等待 weight ready：
+
+```python
+def _create_forward_wrapper(forward: Callable, series: SeriesMetadata, layer_idx: int) -> Callable:
+    def wrapped_forward(*args, **kwargs):
+        # 仅等待 weight 加载，不涉及 DBO
+        series.wait_weight(layer_idx)
+        return forward(*args, **kwargs)
+
+    return wrapped_forward
 ```
 
-## 10. 文件索引
+**DBO hook 仍由 `Flashcomm2OProjRowParallelOp.apply_impl()` 负责** — [`L387-388, 414-415`](../../../../vllm_ascend/ops/linear_op.py#L387)
+
+### 8.2 FlashComm2 DBO Hook 覆盖范围
+
+FlashComm2 的 DBO hook 需要覆盖完整的通信块（包括 O-Shard weight 加载）：
+
+```python
+# Flashcomm2OProjRowParallelOp.apply_impl()
+def apply_impl(self, input_):
+    # ... get input ...
+
+    # DBO record: 通知下游可以开始准备 O-Proj 的输入
+    if forward_context.dbo_enabled:
+        _dbo_call_linear_row_hook(forward_context, is_record=True)  # ← L388
+
+    # ... ODP all-to-all ...
+    # ... matmul（此时 O-Shard 的 wrapped_forward 会自动等待 weight） ...
+    # ... OTP reduce-scatter ...
+
+    # DBO wait: 确保所有通信完成后再让下游（MLP 等）执行
+    if forward_context.dbo_enabled:
+        _dbo_call_linear_row_hook(forward_context, is_record=False)  # ← L415
+```
+
+**关键点**：O-Shard 的 weight broadcast 发生在 **record 和 wait 之间**，属于 DBO 管理的 overlap 范围内。
+
+---
+
+## 9. O-Shard 数据结构总览
+
+### 9.1 全局状态管理
+
+> [`vllm_ascend/ops/layer_shard_linear.py:157-160`](../../../../vllm_ascend/ops/layer_shard_linear.py#L157)
+
+```python
+# 全局字典：记录所有注册的 shard series
+_series_dict: dict[str, SeriesMetadata] = {}
+# 例：{"o_proj": SeriesMetadata(...)}
+
+# 全局字典：记录每个 layer 的外部元数据（指回 series）
+_layer_external_dict: dict[int, LayerExternalMetadata] = {}
+# 例：{id(o_proj_layer_0): LayerExternalMetadata(series=series_dict["o_proj"], layer_idx=0), ...}
+```
+
+### 9.2 Flashcomm2OShardManager 的本地缓存
+
+```python
+# flashcomm2_oshard_manager._shard_layers — vllm_ascend/ops/flashcomm2_oshard_manager.py:L32
+{
+    0: o_proj_layer_0,  # layer_idx → layer object
+    1: o_proj_layer_1,
+    2: o_proj_layer_2,
+    3: o_proj_layer_3,
+}
+```
+
+### 9.3 SeriesMetadata 中的 shard_windows（环形缓冲）
+
+> [`vllm_ascend/ops/layer_shard_linear.py:29-36`](../../../../vllm_ascend/ops/layer_shard_linear.py#L29)
+
+以 prefetch_step=1、TP=4 为例（4 层 O-Proj）：
+
+```python
+shard_windows = [
+    ShardWindowMetadata(weight=tensor[...], data_layer_idx=0, work=None),
+    ShardWindowMetadata(weight=tensor[...], data_layer_idx=1, work=None),
+]
+# 大小 = prefetch_step + 1 = 2
+
+# 时间轴：
+# t=0: window_offset=0
+#      reach_layer(0) 异步加载 layer_1 到 window[1]
+#      window_offset → 1
+#
+# t=1: window_offset=1
+#      reach_layer(1) 异步加载 layer_2 到 window[0]（覆盖）
+#      window_offset → 0
+#
+# t=2: window_offset=0
+#      reach_layer(2) 异步加载 layer_3 到 window[1]（覆盖）
+#      window_offset → 1
+```
+
+### 9.4 LayerMetadata 记录结构
+
+> [`vllm_ascend/ops/layer_shard_linear.py:18-27`](../../../../vllm_ascend/ops/layer_shard_linear.py#L18)
+
+```python
+@dataclass
+class LayerMetadata:
+    layer_idx: int                    # O-Proj 层在模型中的索引
+    layer: LinearBase                 # layer 对象本身
+    post_method: Callable             # layer.quant_method.process_weights_after_loading
+    weight: torch.Tensor              # layer.weight（在非源 rank 被替换为 window tensor）
+    window_idx: int                   # 该 layer 当前关联的 window 索引
+```
+
+---
+
+## 10. O-Shard 配置与启用
+
+## 10. O-Shard 配置与启用
+
+### 10.1 环境变量配置
+
+> [`vllm_ascend/utils.py:1196-1200`](../../../../vllm_ascend/utils.py#L1196)
+
+```bash
+# 同时设置以下两个环境变量启用 O-Shard：
+
+# 1. 启用 FlashComm2
+export VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE=2  # 或其他 > 0 的值
+
+# 2. 启用 O-Proj layer sharding
+export VLLM_ASCEND_LAYER_SHARDING=[o_proj]
+```
+
+**校验逻辑**：
+
+```python
+# flashcomm2_enable()
+def flashcomm2_enable() -> bool:
+    return get_ascend_config().enable_flashcomm2_parallel_size > 0
+
+# o_shard_enable()
+def o_shard_enable() -> bool:
+    layer_sharding = get_ascend_config().layer_sharding
+    if layer_sharding is None:
+        return False
+    return "o_proj" in layer_sharding
+
+# 两者都满足才启用
+def flashcomm2_oshard_enable(self):
+    return flashcomm2_enable() and o_shard_enable()
+```
+
+### 10.2 约束条件检查
+
+> [`vllm_ascend/utils.py:1213-1220`](../../../../vllm_ascend/utils.py#L1213)
+
+O-Shard 只允许 `layer_sharding` 包含 `"o_proj"`，不能包含其他层类型：
+
+```python
+if layer_sharding is not None and flashcomm2_enable():
+    unsupported_layers = [x for x in layer_sharding if x not in ["o_proj"]]
+    if unsupported_layers:
+        raise ValueError(
+            f"FlashComm2 only supports layer_sharding=['o_proj'], "
+            f"got unsupported: {unsupported_layers}"
+        )
+```
+
+---
+
+## 11. 完整调用链路总览
+
+```
+┌────────────────────────────────────────────────────────┐
+│ 配置启用（环境变量）                                     │
+│  VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE=N                │
+│  VLLM_ASCEND_LAYER_SHARDING=[o_proj]                   │
+└────────────────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────────────────┐
+│ 模型初始化阶段                                           │
+│  for each layer in model.layers:                       │
+│    if "o_proj" in layer.prefix:                        │
+│      Op = Flashcomm2OProjRowParallelOp(layer)          │
+│        [linear_op.py:L289]                             │
+│      Op.update_attrs()  [L422-427]                     │
+│        ├─ super().update_attrs()                       │
+│        └─ flashcomm2_oshard_manager.register_layer()   │
+│          [flashcomm2_oshard_manager.py:L37-59]         │
+│            ├─ is_hidden_layer(layer)  [layer_shard_linear.py:L273]
+│            ├─ extract_layer_index(layer.prefix)        │
+│            └─ register_layer_to_shard_weight_series()  │
+│              [layer_shard_linear.py:L205-247]          │
+│                ├─ create SeriesMetadata (if new)       │
+│                ├─ append LayerMetadata                 │
+│                ├─ disable quant_method.process_...()   │
+│                ├─ dispose non-source rank weight       │
+│                └─ wrap layer.forward()                 │
+│                  [L162-168]                             │
+└────────────────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────────────────┐
+│ 权重加载完成后                                           │
+│  AttentionV1.process_weights_after_loading()           │
+│    → flashcomm2_oshard_manager.post_process_after_loading()
+│      [flashcomm2_oshard_manager.py:L90-98]             │
+│      → post_process_after_loading_for_shard_weight_series()
+│        [layer_shard_linear.py:L250-252]                │
+│        → series.post_process_after_loading()           │
+│          [layer_shard_linear.py:L57-114]               │
+│            ├─ sort layers by layer_idx                 │
+│            ├─ for each layer:                          │
+│            │  ├─ broadcast weight                      │
+│            │  └─ call quant_method.process_...()       │
+│            ├─ build shard_windows（环形缓冲）          │
+│            │  size = prefetch_step + 1 = 2              │
+│            └─ forward wrapper already attached          │
+└────────────────────────────────────────────────────────┘
+         ↓
+┌────────────────────────────────────────────────────────┐
+│ 前向传播（迭代 per layer）                              │
+│                                                        │
+│ Layer k Attention:                                     │
+│  Flashcomm2OshardQKVParallelOp[k].apply_impl()        │
+│    [linear_op.py:L479-504]                            │
+│    ├─ QKV forward + matmul                             │
+│    └─ flashcomm2_oshard_manager.trigger_broadcast...()│
+│      [flashcomm2_oshard_manager.py:L72-88]             │
+│      → reach_layer_for_shard_weight_series()           │
+│        [layer_shard_linear.py:L255-257]                │
+│        → series.reach_layer(layer_idx)                 │
+│          [layer_shard_linear.py:L116-136]              │
+│          ├─ 计算 next_layer_idx                        │
+│          ├─ 异步 broadcast next_layer weight          │
+│          │  到 shard_window[next_window_offset]        │
+│          └─ window_offset++ (轮转)                     │
+│                                                        │
+│ Layer k O-Proj:                                        │
+│  Flashcomm2OProjRowParallelOp[k].apply_impl()        │
+│    [linear_op.py:L315-420]                            │
+│    ├─ DBO record hook  [L388]                         │
+│    ├─ wrapped_forward() 自动调用：                     │
+│    │  → series.wait_weight(layer_idx)                  │
+│    │    [layer_shard_linear.py:L138-146]               │
+│    │    └─ 等待 shard_window.work broadcast 完成       │
+│    ├─ otp_maybe_quant_comm()  [L331-375]              │
+│    │  ├─ ODP all-to-all                               │
+│    │  └─ reshape output                                │
+│    ├─ quant_method.apply()  [L400]                    │
+│    │  （W8A8 延迟通信在此）                            │
+│    ├─ OTP reduce-scatter  [L404]                      │
+│    ├─ TP all-gather (if !FC1)  [L410]                 │
+│    ├─ de-pad  [L412]                                   │
+│    └─ DBO wait hook  [L415]                           │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 12. 文件索引
 
 | 文件 | 关键行号 | 内容 |
 |------|----------|------|
+| **FlashComm2 配置** | | |
 | [vllm_ascend/envs.py](../../../../vllm_ascend/envs.py#L76) | 76-80 | 环境变量定义 |
 | [vllm_ascend/ascend_config.py](../../../../vllm_ascend/ascend_config.py#L162) | 162-167, 210-212 | 配置读取 & 校验入口 |
 | [vllm_ascend/utils.py](../../../../vllm_ascend/utils.py#L1191) | 1191-1193 | `flashcomm2_enable()` |
+| [vllm_ascend/utils.py](../../../../vllm_ascend/utils.py#L1196) | 1196-1200 | `o_shard_enable()` ← **O-Shard 启用检查** |
 | [vllm_ascend/utils.py](../../../../vllm_ascend/utils.py#L1203) | 1203-1250 | `get_flashcomm2_config_and_validate()` |
 | [vllm_ascend/utils.py](../../../../vllm_ascend/utils.py#L1253) | 1253-1269 | `get_flashcomm2_reorgnized_batch_ids()` |
+| **通信组** | | |
 | [vllm_ascend/distributed/parallel_state.py](../../../../vllm_ascend/distributed/parallel_state.py#L18) | 18-19 | 全局变量 `_FLASHCOMM2_OTP` / `_FLASHCOMM2_ODP` |
 | [vllm_ascend/distributed/parallel_state.py](../../../../vllm_ascend/distributed/parallel_state.py#L152) | 152-189 | ODP/OTP 组初始化 |
 | [vllm_ascend/distributed/parallel_state.py](../../../../vllm_ascend/distributed/parallel_state.py#L258) | 258-264 | 访问器 `get_flashcomm2_otp/odp_group()` |
-| [vllm_ascend/ops/linear_op.py](../../../../vllm_ascend/ops/linear_op.py#L289) | 289-399 | `Flashcomm2OProjRowParallelOp` 完整类 |
+| **FlashComm2 OProj Op** | | |
+| [vllm_ascend/ops/linear_op.py](../../../../vllm_ascend/ops/linear_op.py#L289) | 289-427 | `Flashcomm2OProjRowParallelOp` 完整类（包括 O-Shard 集成） |
 | [vllm_ascend/ops/linear_op.py](../../../../vllm_ascend/ops/linear_op.py#L694) | 694-730 | `_get_row_parallel_op` 选择逻辑 |
 | [vllm_ascend/ops/linear_op.py](../../../../vllm_ascend/ops/linear_op.py#L240) | 240-281 | `OProjRowParallelOp`（有 DBO hook 的参考） |
+| [vllm_ascend/ops/linear_op.py](../../../../vllm_ascend/ops/linear_op.py#L479) | 479-504 | `Flashcomm2OshardQKVParallelOp` ← **prefetch 触发点** |
+| **O-Shard 核心** | | |
+| [vllm_ascend/ops/flashcomm2_oshard_manager.py](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L15) | 15-101 | `Flashcomm2OShardManager` — 顶层 wrapper |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L18) | 18-56 | `SeriesMetadata` 等数据结构 |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L57) | 57-114 | `post_process_after_loading()` — 权重初始化 |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L116) | 116-136 | `reach_layer()` — prefetch 触发 |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L138) | 138-146 | `wait_weight()` — 等待 weight 就绪 |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L162) | 162-168 | `_create_forward_wrapper()` — forward 包装 |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L205) | 205-247 | `register_layer_to_shard_weight_series()` |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L250) | 250-252 | `post_process_after_loading_for_shard_weight_series()` |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L255) | 255-257 | `reach_layer_for_shard_weight_series()` |
+| [vllm_ascend/ops/layer_shard_linear.py](../../../../vllm_ascend/ops/layer_shard_linear.py#L273) | 273-276 | `is_hidden_layer()` |
+| **Forward Context** | | |
 | [vllm_ascend/ascend_forward_context.py](../../../../vllm_ascend/ascend_forward_context.py#L144) | 144-148 | `flashcomm_v2_enabled` + pad_size 设置 |
 | [vllm_ascend/ascend_forward_context.py](../../../../vllm_ascend/ascend_forward_context.py#L481) | 481-540 | `_EXTRA_CTX` 代理定义 |
-| [vllm_ascend/ascend_forward_context.py](../../../../vllm_ascend/ascend_forward_context.py#L280) | 280-291 | ubatch context 中的 pad_size |
-| [vllm_ascend/ops/flashcomm2_oshard_manager.py](../../../../vllm_ascend/ops/flashcomm2_oshard_manager.py#L15) | 15-101 | Flashcomm2OShardManager |
+| **量化集成** | | |
 | [vllm_ascend/quantization/methods/w8a8_static.py](../../../../vllm_ascend/quantization/methods/w8a8_static.py#L90) | 90-108 | W8A8 量化+通信融合 |
 | [vllm_ascend/quantization/method_adapters.py](../../../../vllm_ascend/quantization/method_adapters.py#L151) | 151-155 | FlashComm2 tp_rank 获取 |
-| [vllm_ascend/dbo/overlap_templates/deepseek.py](../../../../vllm_ascend/dbo/overlap_templates/deepseek.py#L7) | 7-37 | A2 Overlap Template |
+| **DBO 集成** | | |
 | [vllm_ascend/dbo/compile_guard.py](../../../../vllm_ascend/dbo/compile_guard.py#L18) | 18-20 | `_dbo_call_linear_row_hook` wrapper |
+| [vllm_ascend/dbo/overlap_templates/deepseek.py](../../../../vllm_ascend/dbo/overlap_templates/deepseek.py#L7) | 7-37 | A2 Overlap Template |

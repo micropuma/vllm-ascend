@@ -92,11 +92,15 @@ class AscendW8A8LinearMethod(AscendLinearScheme):
             except AttributeError:
                 quant_comm_config = {}
             comm_fn = quant_comm_config.get("communication_fn")
+
+            # 这里通过 attribute 显示拿通信函数
             enable_flashcomm2_quant_comm = comm_fn is not None and (
                 "o_proj" in layer.prefix or "out_proj" in layer.prefix
             )
             if enable_flashcomm2_quant_comm:
                 quant_input_x = x.contiguous().view(-1, layer.aclnn_input_scale_reciprocal.size(0))
+
+                # 先quantization再通信
                 quant_x = torch.ops.vllm.quantize(
                     quant_input_x,
                     layer.aclnn_input_scale,
