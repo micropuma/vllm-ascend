@@ -35,6 +35,20 @@ class AscendNPUGraphMetaData:
     outputs: Any | None = None
 
 
+def _check_thread_exceptions(results: list, context: str) -> None:
+    """Check if any ubatch sub-thread raised an exception and re-raise it.
+
+    This prevents silent thread failures from manifesting as
+    undiagnosable hangs (e.g., HCCL deadlock after a thread crash).
+    """
+    exceptions = [r for r in results if isinstance(r, Exception)]
+    if exceptions:
+        raise RuntimeError(
+            f"{context}: {len(exceptions)} sub-thread(s) failed. "
+            f"First error: {exceptions[0]}"
+        ) from exceptions[0]
+
+
 class NPUCoreControlContextManager:
     def __init__(self, comm_aiv_core: int, comm_aic_core: int, current_stream: Any):
         """
@@ -136,21 +150,24 @@ class AscendUBatchWrapper(UBatchWrapper):
 
         @torch.inference_mode()
         def _capture_ubatch_thread(results, ubatch_metadata):
-            torch.npu.set_device(self.device)
-            ubatch_context = ubatch_metadata.context
-            with torch.npu.stream(ubatch_context.compute_stream):
-                _ = torch.npu.current_blas_handle()
-            with torch.npu.stream(ubatch_context.comm_stream):
-                _ = torch.npu.current_blas_handle()
-            with ubatch_context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
+            try:
+                torch.npu.set_device(self.device)
+                ubatch_context = ubatch_metadata.context
+                with torch.npu.stream(ubatch_context.compute_stream):
+                    _ = torch.npu.current_blas_handle()
+                with torch.npu.stream(ubatch_context.comm_stream):
+                    _ = torch.npu.current_blas_handle()
+                with ubatch_context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
 
-            results.append((ubatch_metadata.context.id, model_output))
+                results.append((ubatch_metadata.context.id, model_output))
+            except Exception as e:
+                results.append(e)
 
         results: list[tuple[int, torch.Tensor]] = []
         compute_stream = ubatch_metadata[0].context.compute_stream
@@ -185,6 +202,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                 ubatch_metadata[0].context.cpu_wait_event.set()
                 for thread in ubatch_threads:
                     thread.join()
+                _check_thread_exceptions(results, "Ubatch graph capture")
                 sorted_results = [value for position, value in sorted(results)]
                 result = torch.cat(sorted_results, dim=0)
                 cudagraph_metadata.outputs = result
@@ -194,23 +212,26 @@ class AscendUBatchWrapper(UBatchWrapper):
     def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
         @torch.inference_mode()
         def _ubatch_thread(results, model, ubatch_metadata):
-            with ubatch_metadata.context:
-                model_output = model(
-                    input_ids=ubatch_metadata.input_ids,
-                    positions=ubatch_metadata.positions,
-                    intermediate_tensors=ubatch_metadata.intermediate_tensors,
-                    inputs_embeds=ubatch_metadata.inputs_embeds,
-                )
-                # 1. queue the comp kernel from other thread
-                # 2. record the comp kernel of cur thread
-                # 3. switch to comm stream
-                # 4. wait for the npu to finish the cur thread's comp kernel
+            try:
+                with ubatch_metadata.context:
+                    model_output = model(
+                        input_ids=ubatch_metadata.input_ids,
+                        positions=ubatch_metadata.positions,
+                        intermediate_tensors=ubatch_metadata.intermediate_tensors,
+                        inputs_embeds=ubatch_metadata.inputs_embeds,
+                    )
+                    # 1. queue the comp kernel from other thread
+                    # 2. record the comp kernel of cur thread
+                    # 3. switch to comm stream
+                    # 4. wait for the npu to finish the cur thread's comp kernel
 
-                # for thread 2, when it reach this point, it will also record and yield back to thread 1
-                dbo_current_stream().synchronize()
-                dbo_yield()
+                    # for thread 2, when it reach this point, it will also record and yield back to thread 1
+                    dbo_current_stream().synchronize()
+                    dbo_yield()
 
-            results.append((ubatch_metadata.context.id, model_output))
+                results.append((ubatch_metadata.context.id, model_output))
+            except Exception as e:
+                results.append(e)
 
         results: list[tuple[int, torch.Tensor]] = []
 
@@ -234,6 +255,7 @@ class AscendUBatchWrapper(UBatchWrapper):
             ubatch_metadata[0].context.cpu_wait_event.set()
             for thread in ubatch_threads:
                 thread.join()
+            _check_thread_exceptions(results, "Ubatch runtime")
         sorted_results = [value for position, value in sorted(results)]
         # if enable sp, we should unpad the model output first
         if get_forward_context().flash_comm_v1_enabled and get_pp_group().is_last_rank:
