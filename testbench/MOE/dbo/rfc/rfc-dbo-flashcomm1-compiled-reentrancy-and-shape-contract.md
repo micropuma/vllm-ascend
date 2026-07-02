@@ -15,6 +15,19 @@
 
 ## 摘要
 
+> 2026-07-02 follow-up correction:
+>
+> 1. upstream vLLM 的两个 ubatch 线程同样复用同一个 model/compiled
+>    callable；其正确性约束是 host thread 在每个 yield 点严格交替执行，而不是
+>    “必须存在两个 compiled callable”。本文早期将 shared callable 直接认定为
+>    根因的表述不够准确。当前更精确的故障边界是 Ascend compiled/custom-op
+>    路径没有完整保留 hook 与 opaque collective 之间的 host submission order。
+> 2. 生成图证明 model input 的 token 维已经是 `Sym(s72)`。动态性首先在
+>    FlashComm1 的 `maybe_unpad_after_all_gather(...,
+>    forward_context.num_tokens)` 丢失：Python context 值 8192 被写成图常量，
+>    down-proj reduce-scatter 随后产生固定 4096 rows，并污染后续所有层。MLA
+>    output allocation 再次读取 `_EXTRA_CTX.num_tokens` 会进一步固化该错误。
+
 在 DeepSeek-V2、TP=2、FlashComm1、DBO、AI_CPU、vLLM compile
 同时开启时，系统呈现两个彼此独立、但会连续暴露的缺陷：
 
@@ -42,9 +55,11 @@
 
 本 RFC 建议把问题拆成两个 contract 分别修复：
 
-1. **Execution contract**：DBO 双线程不得并发复用未声明为 reentrant 的 compiled
-   execution instance。短期对真实 DBO runtime 使用 eager fallback；长期给两个
-   ubatch 建立独立 compiled execution instance。
+1. **Execution contract**：DBO 必须保证任一时刻只有一个 host thread 提交任务，
+   且 hook/event/yield 与对应 collective 之间存在明确的 happens-before。短期对
+   DBO + FlashComm1 runtime 使用 eager fallback；长期将 hook 放到可靠的
+   control-plane/compiled partition boundary。只有 backend 最终证明 execution
+   state 不可共享时，才需要 per-ubatch compiled instance。
 2. **Shape contract**：MLA logical token count 必须成为可符号化、可参与 guard/cache
    key 的显式 graph input，禁止通过 Python forward context 决定 compiled tensor
    的第一维。
@@ -427,6 +442,24 @@ EngineCore 日志确认配置生效，但 4K DBO 仍 timeout。这说明：
 
 ## 5.1 Root cause A：compiled execution contract 未定义 DBO 可重入性
 
+### Follow-up：shared callable 不是充分根因
+
+upstream `gpu_ubatch_wrapper.py` 也把同一个 `model` 传给两个 ubatch thread。
+upstream `UBatchContext._cpu_yield()` 明确要求任一时刻只有一个线程运行，并通过
+CPU events 在 compiled callable 内部交替恢复两个栈帧。因此“存在两个线程栈帧”
+不等价于“两个 host threads 同时提交 compiled callable”，也不能据此要求复制
+两个 compiled callable。
+
+Ascend 当前更可疑的差异是 hook 被包装成 compiled custom op。生成图中 hook
+返回值立即丢弃，未形成到后续 collective 的 tensor dependency；部分 collective
+又位于 `mla_forward`、`matmul_and_reduce` 等 opaque custom op 内。仅将外层 hook
+加入 `splitting_ops`，无法证明 hook/event/yield 与 opaque op 内 collective
+submission 之间存在 happens-before。
+
+因此后续诊断应首先比较两个 rank 的 host collective sequence，而不是直接实现
+两个 compiled models。只有 backend trace 证明 compiled execution state 在严格
+CPU 交替下仍不可共享，才进入 per-ubatch execution instance 方案。
+
 DBO 的并发模型要求：
 
 ```text
@@ -484,6 +517,42 @@ workspace/output address
 对象。RFC 不把尚未观测的 backend 内部状态写成已确认事实。
 
 ## 5.2 Root cause B：Python runtime context 被误用为 compiled shape input
+
+### Follow-up：动态性首先在 FlashComm1 unpad 丢失
+
+实际 `computation_graph.py` 入口已经包含：
+
+```text
+s72: Sym(s72)
+input_ids: i32[s72]
+first local hidden: bf16[((s72 + 1) // 2), 2048]
+```
+
+第一层 MLA output 在较早的 tensor-derived 实验图中也仍是
+`[((s72 + 1) // 2), 2048]`。真正的第一次静态化发生在：
+
+```python
+maybe_unpad_after_all_gather(
+    all_gather,
+    forward_context.num_tokens,
+)
+```
+
+trace 时 `forward_context.num_tokens == 8192`，生成图因此成为：
+
+```text
+all_gather: [2 * ceil(s72 / 2), 2048]
+maybe_unpad_after_all_gather: [8192, 2048]
+matmul_and_reduce: [4096, 2048]
+```
+
+从该 down-proj 输出开始，后续 MLA、RMSNorm 和 MoE 全部固定为 4096。当前
+`_resolve_mla_forward_inputs()` 再读取 `_EXTRA_CTX.num_tokens` 分配 output，
+会让静态化更早发生，但它不是唯一的 context-to-shape 泄漏点。
+
+所以 symbolic contract 修复必须审计所有进入 compiled graph 的 token-length
+参数，尤其是 pad/unpad、reduce-scatter output shape 和 custom-op FakeImpl；
+不能只修改 MLA 的 `torch.empty()`。
 
 当前实验补丁增加了：
 
@@ -967,9 +1036,10 @@ length，而不是在最后赋值处截断。
 4. 引入 runtime-only DBO `skip_compiled` fallback。
 5. 完成 4K single 和 32x96 concurrent correctness。
 6. 跑 500x4096/concurrency96 soak test。
-7. 在 compiler backend 增加 execution-instance capability。
-8. 实现两个 per-ubatch compiled runners。
-9. 将 hooks 正式迁移为 control-plane splitting boundaries。
+7. 对 compiled runtime 的 hook 与 collective submission 建立逐层序列 trace。
+8. 验证 backend 是否持有跨 hook/yield 的调用级状态；只有证据确认后，才评估
+   per-ubatch compiled runner。
+9. 将 hooks 正式迁移为有明确 happens-before 语义的 control-plane boundary。
 10. 对比 eager fallback 与 per-ubatch compiled 的 TTFT、QPS 和 overlap trace。
 
 ---
@@ -983,23 +1053,60 @@ length，而不是在最后赋值处截断。
   -> 8/4096
   -> 临时补丁后变成 8/52
 
-问题 B：DBO 双线程并发复用同一个 AOT compiled callable
-  -> TP ranks collective progress divergence
+问题 B：compiled graph 内的 hook/yield 与 opaque collective submission
+       没有形成可验证的 happens-before contract
+  -> 两个 ubatch 的 host submission progress 最终分叉
   -> thread.join 永久等待
 ```
 
 eager 对照、splitting-op 对照和 runtime-only `skip_compiled` 对照共同把问题定位到：
 
-> 当前 compiled model execution contract 不覆盖 DBO 所需的 concurrent,
-> per-stream, reentrant invocation；同时当前 MLA patch 把 runtime Python
-> context 错当成 dynamic graph shape。
+> 当前 compiled model execution contract 没有证明它保留 DBO 所需的
+> per-stream host submission 顺序；同时旧 MLA patch 把 runtime Python
+> context 错当成 dynamic graph shape。上游同样让两个 ubatch 线程调用同一个
+> model，因此“共享 callable”本身不是充分根因，也不能直接推出必须复制 callable。
 
 正确修复必须同时提供：
 
-- per-ubatch 独立 compiled execution state；
+- 可验证的 per-ubatch compiled execution/order contract；
 - graph 外的 DBO control-plane hooks；
 - 显式 symbolic logical-length；
 - runtime/FakeImpl/compiled 一致的 sequence-parallel shape contract。
 
 在这些 contract 完成前，最安全的产品策略是：保留 server compile 能力和 non-DBO
 compiled path，但对真实 DBO dual-thread runtime 使用严格限域的 eager fallback。
+
+### 11.1 2026-07-02 远端验证补充
+
+MLA allocation 已改为直接继承输入 tensor 的 symbolic token 维度，不再从
+`_EXTRA_CTX.num_tokens` 构造 Python 整数 shape。fresh cache 生成图显示：
+
+```text
+input:      bf16[s72, 2048]
+TP local:   bf16[((s72 + 1)//2), 2048]
+MLA output: bf16[((s72 + 1)//2), 2048]
+```
+
+在 DBO+FlashComm1 runtime eager fallback 下：
+
+- 4096 输入：1/1 成功，benchmark mean TTFT 248.98 ms；
+- 96 输入、32 requests、concurrency 16：32/32 成功，mean TTFT 582.48 ms。
+
+不能把 FC1 的 `maybe_unpad_after_all_gather(..., num_tokens)` 同时删除。该实验会
+使 4K DBO 卡死；MLA local symbolic shape 与 FC1 global logical length 是两个
+独立 contract。
+
+关闭 fallback 后，4K 请求稳定超时。runtime hook trace 表明两个 ubatch 均能进入
+同一 compiled graph 并交替执行多个 layer；因此“第二个线程无法进入 callable”
+也不符合事实。最终停点为：
+
+```text
+ubatch A: dbo_moe_prepare_hook(record=False) -> CPU yield/wait
+ubatch B: 未到达对应的下一 control boundary
+```
+
+两 rank 都呈现同类停点。该证据把后续定位范围缩小到 `moe_prepare` 前后的 opaque
+collective submission 与 compiled segment 边界，而不是 MLA shape 或简单的
+callable 数量。下一步 trace 必须加入 layer、ubatch id、collective enter/return
+以及 stream，确认 B 停在 dispatch collective、compiled segment lock，还是设备
+event wait。
