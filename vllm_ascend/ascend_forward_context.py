@@ -72,6 +72,7 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     ubatch_slices: UBatchSlices | None = None,
+    ubatch_slices_logical: UBatchSlices | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -92,6 +93,7 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+        forward_context.ubatch_slices_logical = ubatch_slices_logical
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -270,9 +272,13 @@ def create_ascend_forward_context(
 
     new_forward_context.flash_comm_v1_enabled = cur_forward_context.flash_comm_v1_enabled
 
-    new_forward_context.num_tokens = _get_actual_num_tokens(
-        attn_metadata, ubatch_slices[ubatch_num].num_tokens
-    )
+    slice_num_tokens = ubatch_slices[ubatch_num].num_tokens
+    if cudagraph_runtime_mode is CUDAGraphMode.FULL:
+        new_forward_context.num_tokens = _get_actual_num_tokens(
+            attn_metadata, slice_num_tokens
+        )
+    else:
+        new_forward_context.num_tokens = slice_num_tokens
 
     tp_world_size = get_tensor_model_parallel_world_size()
     dp_world_size = get_dp_group().world_size
@@ -281,6 +287,13 @@ def create_ascend_forward_context(
     if new_forward_context.flash_comm_v1_enabled or new_forward_context.flashcomm_v2_enabled:
         pad_size = (tp_world_size - (new_forward_context.num_tokens % tp_world_size)) % tp_world_size
         new_forward_context.pad_size = pad_size
+
+    # Track logical token count per ubatch for correct output unpad
+    ubatch_slices_logical = getattr(cur_forward_context, 'ubatch_slices_logical', None)
+    if ubatch_slices_logical is not None:
+        new_forward_context.num_tokens_logical = ubatch_slices_logical[ubatch_num].num_tokens
+    else:
+        new_forward_context.num_tokens_logical = new_forward_context.num_tokens
 
     if dp_world_size > 1 and new_forward_context.dp_metadata is not None:
         dp_meta = new_forward_context.dp_metadata

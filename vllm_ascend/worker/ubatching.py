@@ -18,6 +18,25 @@ _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list[Optional["UBatchContext"]] = []
 
 
+def dbo_debug_trace(label: str) -> None:
+    thread_id = threading.get_ident()
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(thread_id, -1)
+    ctx = _CURRENT_CONTEXTS[ctx_idx] if ctx_idx >= 0 else None
+    if ctx is not None:
+        sequence = getattr(ctx, "_debug_sequence", 0)
+        ctx._debug_sequence = sequence + 1
+        stream = getattr(dbo_current_stream(), "npu_stream", None)
+    else:
+        sequence = -1
+        stream = None
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(
+        f"DBO_TRACE rank={rank} ubatch={ctx_idx} seq={sequence} "
+        f"thread={thread_id} stream={stream} label={label}",
+        flush=True,
+    )
+
+
 class UBatchEventKey(Enum):
     ATTN_PRE = 0
     ATTN_POST = 1
