@@ -31,6 +31,49 @@ def set_flash_comm_v1_snapshot(value: bool) -> None:
     _FLASH_COMM_V1_SNAPSHOT = value
 
 
+def _run_dbo_hook(x: torch.Tensor, hook_name: str, is_record: bool) -> None:
+    forward_context = get_forward_context()
+    if forward_context.dbo_template is not None:
+        getattr(forward_context.dbo_template, hook_name)(is_record=is_record)
+    return x
+
+
+def _dbo_linear_column_hook_impl(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return _run_dbo_hook(x, "dbo_linear_column_hook", is_record)
+
+
+def _dbo_linear_row_hook_impl(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return _run_dbo_hook(x, "dbo_linear_row_hook", is_record)
+
+
+def _dbo_mla_preprocess_hook_impl(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return _run_dbo_hook(x, "dbo_mla_preprocess_hook", is_record)
+
+
+def _dbo_moe_prepare_hook_impl(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return _run_dbo_hook(x, "dbo_moe_prepare_hook", is_record)
+
+
+def _dbo_moe_finalize_hook_impl(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return _run_dbo_hook(x, "dbo_moe_finalize_hook", is_record)
+
+
+def _dbo_hook_fake(x: torch.Tensor, is_record: bool) -> torch.Tensor:
+    return x
+
+
+def _slice_tp_local_residual(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+    local_num_tokens = x.size(0)
+    global_num_tokens = local_num_tokens * tp_size
+    if residual.size(0) < global_num_tokens:
+        residual = F.pad(residual, (0, 0, 0, global_num_tokens - residual.size(0)))
+    start = tp_rank * local_num_tokens
+    end = start + local_num_tokens
+    return residual[start:end]
+
+
 def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
     try:
         get_forward_context()
@@ -38,12 +81,7 @@ def _maybe_chunk_residual_impl(x: torch.Tensor, residual: torch.Tensor) -> torch
         return residual
 
     if x.size(0) != residual.size(0):
-        pad_size = _EXTRA_CTX.pad_size
-        if pad_size > 0:
-            residual = F.pad(residual, (0, 0, 0, pad_size))
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        residual = torch.chunk(residual, tp_size, dim=0)[tp_rank]
+        residual = _slice_tp_local_residual(x, residual)
 
     return residual
 
@@ -318,6 +356,23 @@ def _muls_add_impl_fake(
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
+
+_DBO_HOOK_OPS = {
+    "dbo_linear_column_hook": _dbo_linear_column_hook_impl,
+    "dbo_linear_row_hook": _dbo_linear_row_hook_impl,
+    "dbo_mla_preprocess_hook": _dbo_mla_preprocess_hook_impl,
+    "dbo_moe_prepare_hook": _dbo_moe_prepare_hook_impl,
+    "dbo_moe_finalize_hook": _dbo_moe_finalize_hook_impl,
+}
+
+for _op_name, _op_func in _DBO_HOOK_OPS.items():
+    direct_register_custom_op(
+        op_name=_op_name,
+        op_func=_op_func,
+        fake_impl=_dbo_hook_fake,
+        mutates_args=[],
+        dispatch_key="PrivateUse1",
+    )
 
 direct_register_custom_op(
     op_name="maybe_chunk_residual",

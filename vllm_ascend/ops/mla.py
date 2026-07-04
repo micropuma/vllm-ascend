@@ -160,20 +160,27 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         hidden_dim = self.hidden_size
+        hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
+            hidden_states, _EXTRA_CTX.flash_comm_v1_enabled, self.tp_size, self.is_vl_first_layer
+        )
 
-        if _EXTRA_CTX.flash_comm_v1_enabled and self.tp_size > 1 and self.is_vl_first_layer:
-            need_gather_q_kv = False
-            n_out = hidden_states.shape[0] // self.tp_size
-            output = torch.empty((n_out, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
-        else:
-            need_gather_q_kv = _EXTRA_CTX.flash_comm_v1_enabled
-            output = torch.empty(
-                (hidden_states.shape[0], hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-            )
+        output = torch.empty((output_tokens, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
 
         torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output, self.prefix)
         output = output.view(-1, hidden_dim)
         return output
+
+
+def _resolve_mla_forward_inputs(
+    hidden_states: torch.Tensor,
+    flash_comm_v1_enabled: bool,
+    tp_size: int,
+    is_vl_first_layer: bool,
+) -> tuple[torch.Tensor, int, bool]:
+    if flash_comm_v1_enabled and tp_size > 1 and is_vl_first_layer:
+        return hidden_states, hidden_states.shape[0] // tp_size, False
+
+    return hidden_states, hidden_states.shape[0], flash_comm_v1_enabled
 
 
 def mla_forward(

@@ -37,7 +37,6 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.dbo.compile_guard import _dbo_call_moe_prepare_hook, _dbo_call_moe_finalize_hook
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -403,7 +402,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                     unpadded_length = 0
                     padded_length = 0
 
-                _dbo_call_moe_prepare_hook(forward_context, is_record=True)
+                torch.ops.vllm.dbo_moe_prepare_hook(hidden_states, is_record=True)
                 if flash_comm_enabled:
                     if use_ep_comm:
                         hidden_states = get_ep_group().all_gather(hidden_states, 0)
@@ -416,7 +415,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                         if pertoken_scale is not None:
                             pertoken_scale = tensor_model_parallel_all_gather(pertoken_scale, 0)
                     # A2 DBO for FC1/FC2, overlap the comm of o_proj + moe prepare
-                    _dbo_call_moe_prepare_hook(forward_context, is_record=False)
+                    torch.ops.vllm.dbo_moe_prepare_hook(hidden_states, is_record=False)
                 if flash_comm_enabled:
                     hidden_states = torch.ops.vllm.maybe_unpad_after_all_gather(
                         hidden_states, unpadded_length, padded_length, use_ep_comm
@@ -588,7 +587,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 hidden_states = torch.ops.vllm.maybe_prepare_for_reduce(
                     hidden_states, prepared_length, padded_length, use_ep_comm
                 )
-            _dbo_call_moe_finalize_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=True)
             if flash_comm_enabled:
                 if use_ep_comm:
                     hidden_states = get_ep_group().reduce_scatter(hidden_states, 0)
@@ -596,7 +595,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                     hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-            _dbo_call_moe_finalize_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=False)
 
         else:
             hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)

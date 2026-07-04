@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.dbo.compile_guard import _dbo_call_mla_preprocess_hook
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata, CPChunkedContextMetadata
@@ -1668,11 +1667,11 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_mla_preprocess_hook(forward_context, is_record=True)
+            forward_context.dbo_template.dbo_mla_preprocess_hook(is_record=True)
             if forward_context.flash_comm_v1_enabled and need_gather_q_kv:
                 q_c = tensor_model_parallel_all_gather(q_c.contiguous(), 0)
                 kv_no_split = tensor_model_parallel_all_gather(kv_no_split.contiguous(), 0)
-            _dbo_call_mla_preprocess_hook(forward_context, is_record=False)
+            forward_context.dbo_template.dbo_mla_preprocess_hook(is_record=False)
             if forward_context.flash_comm_v1_enabled and need_gather_q_kv:
                 q_c = torch.ops.vllm.maybe_unpad_after_all_gather(q_c, forward_context.num_tokens)
                 kv_no_split = torch.ops.vllm.maybe_unpad_after_all_gather(kv_no_split, forward_context.num_tokens)
@@ -1808,10 +1807,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             linear_layer=self.o_proj,
         )
         o_proj_output = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
-        # Sequence-parallel collectives may pad an odd token count to make it
-        # divisible by TP. Keep the MLA output contract at the logical ubatch
-        # length for eager, compiled, and graph execution alike.
-        output[...] = o_proj_output[:output.shape[0]]
+        # The compiled graph owns a padded output buffer, while FlashComm1 may
+        # produce only the TP-local logical rows at runtime. Preserve the graph
+        # buffer shape and populate its valid prefix.
+        output.zero_()
+        output[: o_proj_output.shape[0]] = o_proj_output
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

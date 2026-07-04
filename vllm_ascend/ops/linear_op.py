@@ -63,7 +63,6 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.dbo.compile_guard import _dbo_call_linear_column_hook, _dbo_call_linear_row_hook
 from vllm_ascend.distributed.parallel_state import (
     get_flashcomm2_odp_group,
     get_flashcomm2_otp_group,
@@ -198,9 +197,9 @@ class MLPColumnParallelOp(CustomColumnParallelOp):
         assert self.quant_method is not None
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_linear_column_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_linear_column_hook(input_, is_record=True)
             input_parallel = self.comm_group.all_gather(input_, 0)
-            _dbo_call_linear_column_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_linear_column_hook(input_parallel, is_record=False)
         else:
             input_parallel = self.comm_group.all_gather(input_, 0)
         output = self.quant_method.apply(self.layer, input_parallel, bias)
@@ -261,7 +260,7 @@ class OProjRowParallelOp(CustomRowParallelOp):
         # reduce scatter to achieve better overlap performance
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_linear_row_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_linear_row_hook(input_parallel, is_record=True)
         dist.all_to_all_single(recv_buf, send_buf, group=self.comm_group.device_group)
         input_parallel = recv_buf.view(total_batch_size, chunk_size)
 
@@ -273,7 +272,7 @@ class OProjRowParallelOp(CustomRowParallelOp):
         # otp-specific: Combine partial results across devices
         output = self.comm_group.reduce_scatter(output_parallel, dim=0)
         if forward_context.dbo_enabled:
-            _dbo_call_linear_row_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_linear_row_hook(output, is_record=False)
         output = output.view(input_.shape[0], self.layer.output_size)
 
         # Handle bias return based on configuration
@@ -385,7 +384,7 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         # consistent collective submission order across ubatch threads on two NPU streams.
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_linear_row_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_linear_row_hook(input_parallel, is_record=True)
 
         if not isinstance(actual_quant_method, AscendW8A8LinearMethod):
             # Check if w8a8 quantization is enabled. If not, communicate immediately.
@@ -412,7 +411,7 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
                 output = output[:-num_padding_tokens]
 
         if forward_context.dbo_enabled:
-            _dbo_call_linear_row_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_linear_row_hook(output, is_record=False)
 
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None
@@ -482,14 +481,12 @@ class SequenceColumnParallelOp(CustomColumnParallelOp):
         # dbo overlap for qwen3 moe with flashcomm1
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_linear_column_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_linear_column_hook(input_, is_record=True)
             if forward_context.flash_comm_v1_enabled and need_all_gather:
                 input_ = tensor_model_parallel_all_gather(input_, 0)
 
-            _dbo_call_linear_column_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_linear_column_hook(input_, is_record=False)
 
-            if forward_context.flash_comm_v1_enabled and need_all_gather:
-                input_ = torch.ops.vllm.maybe_unpad_after_all_gather(input_, forward_context.num_tokens)
         else:
             input_ = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(input_, label=need_all_gather)
 
@@ -572,19 +569,19 @@ class SequenceRowParallelOp(CustomRowParallelOp):
             # A2 DBO for FC1, overlap the o_proj + moe prepare
             forward_context = get_forward_context()
             if forward_context.dbo_enabled:
-                _dbo_call_linear_row_hook(forward_context, is_record=True)
+                forward_context.dbo_template.dbo_linear_row_hook(is_record=True)
                 output = tensor_model_parallel_all_reduce(output_parallel)
-                _dbo_call_linear_row_hook(forward_context, is_record=False)
+                forward_context.dbo_template.dbo_linear_row_hook(is_record=False)
             else:
                 output = tensor_model_parallel_all_reduce(output_parallel)
             return output
 
-        pad_size = _EXTRA_CTX.pad_size
+        world_size = self.layer.tp_size
+        pad_size = (-x.shape[0]) % world_size
         dsa_cp_attn_out = enable_dsa_cp() and ("o_proj" in self.layer.prefix or "wo_b" in self.layer.prefix)
         if pad_size > 0 and not dsa_cp_attn_out:
             x = F.pad(x, (0, 0, 0, pad_size))
 
-        world_size = self.layer.tp_size
         comm_mode = "aiv"
         hcom_name = get_tp_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.layer.tp_rank)
 

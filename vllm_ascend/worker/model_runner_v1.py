@@ -2231,7 +2231,8 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
-                ubatch_slices=ubatch_slices_attn,
+                ubatch_slices=ubatch_slices_padded,
+                ubatch_slices_logical=ubatch_slices_attn,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -3550,7 +3551,8 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
-                ubatch_slices=(
+                ubatch_slices=ubatch_slices_padded,
+                ubatch_slices_logical=(
                     ubatch_slices_padded
                     if cudagraph_runtime_mode == CUDAGraphMode.FULL
                     else ubatch_slices

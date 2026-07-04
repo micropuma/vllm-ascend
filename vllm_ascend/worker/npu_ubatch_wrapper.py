@@ -262,9 +262,12 @@ class AscendUBatchWrapper(UBatchWrapper):
             for i in range(2):
                 sorted_results[i] = tensor_model_parallel_all_gather(sorted_results[i], 0)
 
-                pad_size = ubatch_metadata[i].context.forward_context.pad_size
-                if pad_size > 0:
-                    sorted_results[i] = sorted_results[i][:-pad_size, :]
+                ctx = ubatch_metadata[i].context.forward_context
+                num_padded = ctx.num_tokens
+                num_logical = getattr(ctx, 'num_tokens_logical', num_padded)
+                output_pad = num_padded - num_logical
+                if output_pad > 0:
+                    sorted_results[i] = sorted_results[i][:-output_pad, :]
         if not get_pp_group().is_last_rank:
             # Merge the IntermediateTensors in pp scenarios
             result = self._merge_intermediate_tensors(sorted_results)
@@ -303,6 +306,7 @@ class AscendUBatchWrapper(UBatchWrapper):
                     ubatch_slices=ubatch_slices,
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    skip_compiled=cur_forward_context.skip_compiled,
                     ubatch_num=i,
                     positions=positions,
                     dbo_template=dbo_template,

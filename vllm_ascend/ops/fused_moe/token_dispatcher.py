@@ -31,7 +31,6 @@ from vllm.forward_context import get_forward_context
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.dbo.compile_guard import _dbo_call_moe_prepare_hook, _dbo_call_moe_finalize_hook
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
@@ -489,7 +488,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         dynamic_scale_after_all2all = None
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_moe_prepare_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_moe_prepare_hook(permutated_local_input_tokens, is_record=True)
         if with_quant:
             dst_type = torch.float8_e4m3fn if token_dispatch_input.quant.is_fp8 else torch.int8
             permutated_local_input_tokens, dynamic_scale = torch_npu.npu_dynamic_quant(
@@ -506,7 +505,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         )
         permute1_ep_all_to_all_handle.wait()
         if forward_context.dbo_enabled:
-            _dbo_call_moe_prepare_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_moe_prepare_hook(global_input_tokens, is_record=False)
         permutated_local_input_tokens.untyped_storage().resize_(0)
 
         # Postprocess
@@ -545,7 +544,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
 
         forward_context = get_forward_context()
         if forward_context.dbo_enabled:
-            _dbo_call_moe_finalize_hook(forward_context, is_record=True)
+            torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=True)
 
         _, permutated_local_input_tokens, handle = async_all_to_all(
             hidden_states,
@@ -556,7 +555,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
         handle.wait()
 
         if forward_context.dbo_enabled:
-            _dbo_call_moe_finalize_hook(forward_context, is_record=False)
+            torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=False)
         hidden_states.untyped_storage().resize_(0)
 
         # 3. Postprocess using metadata
