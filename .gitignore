@@ -225,3 +225,8 @@ csrc/third_party/
 .vllm_ascend/
 .agents/
 profile/
+
+cache/
+logs/
+results/
+tl_out/
