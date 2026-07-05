@@ -618,3 +618,6 @@ FlashComm1 路径:
 | `vllm_ascend/ops/fused_moe/prepare_finalize.py` | MoE 的 AG / RS 替换 | :390-414, :515-543 |
 | `vllm_ascend/ops/flashcomm2_oshard_manager.py` | FlashComm2 O-Shard 管理 | :1-101 |
 | `vllm_ascend/worker/model_runner_v1.py` | 模型输出后 all_gather 恢复全量 | :2588-2593 |
+
+## 参考资料  
+1. [vllm-ascend通信优化](https://hwcomputing.csdn.net/6a0d698b10ee7a33f273e68c.html)
