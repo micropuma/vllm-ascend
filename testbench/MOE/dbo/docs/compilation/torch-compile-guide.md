@@ -691,3 +691,318 @@ tlparse /tmp/torch_trace
 PyTorch dynamic-shape文档推荐使用 `TORCH_LOGS=dynamic` 检查symbol创建和guard
 产生原因；vLLM调试文档推荐使用 `TORCH_TRACE` 与 `tlparse` 检查Dynamo graph、
 piecewise split和后端编译产物。生产压测不应默认开启这些高开销日志。
+
+---
+
+## 七、vllm-ascend 如何接入上游 compilation 与 CUDAGraph 流程
+
+第五章描述了 compilation 链路的五层结构，本章聚焦**接入机制**：vllm-ascend
+作为 out-of-tree（OOT）平台，如何在不修改上游源码的前提下，把自己的编译器、
+PassManager、图捕获器注入 vLLM 的编译框架。
+
+### 7.1 平台发现：从 entry_point 到 NPUPlatform
+
+vLLM 启动时通过 Python entry point 发现 OOT 平台：
+
+```text
+setup.py entry_points
+  "vllm.platform_plugins": ["ascend = vllm_ascend:register"]
+        │
+        ▼
+vllm_ascend.register()
+  return "vllm_ascend.platform.NPUPlatform"
+        │
+        ▼
+resolve_obj_by_qualname("vllm_ascend.platform.NPUPlatform")
+  → 实例化为 current_platform 单例
+```
+
+`NPUPlatform` 继承 vLLM 的 `Platform` 基类，通过覆写三个 classmethod
+把 Ascend 组件注册到上游框架中：
+
+| 注册点 | 方法 | 返回值 |
+|---|---|---|
+| 编译器 | `get_compile_backend()` | `"vllm_ascend.compilation.compiler_interface.AscendCompiler"` |
+| PassManager | `get_pass_manager_cls()` | `"vllm_ascend.compilation.graph_fusion_pass_manager.GraphFusionPassManager"` |
+| 图捕获器 | `get_static_graph_wrapper_cls()` | `"vllm_ascend.compilation.acl_graph.ACLGraphWrapper"` |
+
+[VERIFY: vllm_ascend/platform.py:186]
+[VERIFY: vllm_ascend/platform.py:194]
+[VERIFY: vllm_ascend/platform.py:202]
+[VERIFY: vllm_ascend/platform.py:622]
+[VERIFY: vllm_ascend/platform.py:902]
+
+### 7.2 编译器注入：CompilerInterface 抽象与 make_compiler 工厂
+
+上游 vLLM 定义了 `CompilerInterface` 抽象基类，所有编译后端必须实现四个方法：
+
+```text
+CompilerInterface
+  ├─ initialize_cache(cache_dir, ...) → None
+  ├─ compute_hash(vllm_config) → str
+  ├─ compile(graph, example_inputs, compiler_config, compile_range, key)
+  │     → (Callable | None, handle | None)
+  └─ load(handle, graph, ...) → Callable
+```
+
+vLLM 内置了三个标准实现（`InductorAdaptor`、`InductorStandaloneAdaptor`、`EagerAdaptor`），
+都定义在 `vllm/compilation/compiler_interface.py` 同一个文件中。
+`AscendCompiler` 是唯一的 OOT 实现。
+
+`backends.py` 中的 `make_compiler()` 是工厂函数，决定了实例化哪个编译器：
+
+```python
+def make_compiler(compilation_config):
+    if compilation_config.backend == "inductor":
+        return InductorStandaloneAdaptor(...) or InductorAdaptor()  # CUDA 路径
+    elif compilation_config.backend == "eager":
+        return EagerAdaptor()                                        # 调试路径
+    else:
+        # Ascend 走这里：
+        compiler = resolve_obj_by_qualname(
+            current_platform.get_compile_backend()
+        )()                    # → AscendCompiler()
+        return compiler
+```
+
+[VERIFY: vllm/compilation/backends.py make_compiler]
+
+关键设计：上游只需 switch 三个内置选择，OOT 平台通过 `current_platform.get_compile_backend()`
+把类名注入 `else` 分支。`resolve_obj_by_qualname` 按字符串延迟 import——
+vLLM 启动时不需要 `torch_npu` 可用，只有真正编译时才触发 import。
+
+### 7.3 编译调度链路：从 PiecewiseBackend 到 AscendCompiler
+
+`AscendCompiler` 不是被直接调用的，中间还有一层 `CompilerManager`（backends.py）：
+
+```text
+VllmBackend.__init__()
+    │
+    └─ self.compiler_manager = CompilerManager(compilation_config)
+         │
+         └─ self.compiler = make_compiler(compilation_config)
+              # → AscendCompiler 实例
+
+compile 时:
+
+PiecewiseBackend.compile_all_ranges()
+    │
+    └─ for each compile_range:
+         self.vllm_backend.compiler_manager.compile(
+             graph, example_inputs, config, compile_range, key
+         )
+              │
+              ├─ 1. 生成 key: "artifact_compile_range_{start}_{end}_subgraph_{idx}"
+              ├─ 2. 查缓存 → 命中 → self.compiler.load(handle)
+              └─ 3. 未命中 → self.compiler.compile(graph, inputs, ...)
+                   │
+                   └─ AscendCompiler.compile(...)
+```
+
+[VERIFY: vllm/compilation/backends.py CompilerManager]
+
+`CompilerManager` 的职责是缓存管理和 key 生成——它确保同一个
+`(compile_range, graph_index)` 只编译一次。`AscendCompiler` 只需关心
+"输入 FX graph，输出 runnable"，不用管缓存策略。
+
+### 7.4 AscendCompiler.compile() 内部：双后端路径
+
+```text
+AscendCompiler.compile(graph, example_inputs, compiler_config, compile_range, key)
+    │
+    ├─ 1. deepcopy graph           ← 防止 inductor 修改原始图
+    ├─ 2. fake_mode 对齐           ← 统一 FakeTensor 的 fake_mode
+    │
+    ├─ 3. enable_npugraph_ex ?
+    │
+    ├── YES ──▶ npugraph_ex_compile()
+    │              │
+    │              ├─ try: import npugraph_ex
+    │              │    ├─ CompilerConfig(force_eager=True, inplace_pass=False, ...)
+    │              │    ├─ 可选: static_kernel_compile + sym_range (按 batch sizes 限制)
+    │              │    ├─ backend = nge.get_npu_backend(compiler_config=config)
+    │              │    └─ 编译产物可选缓存: py_code → 文件 (跳过含 Triton kernel 的图)
+    │              │
+    │              └─ except ImportError: → torchair fallback
+    │                   ├─ CompilerConfig(mode="reduce-overhead", run_eagerly=True, ...)
+    │                   └─ backend = torchair.get_npu_backend(compiler_config=config)
+    │
+    └── NO ───▶ fusion_pass_compile()
+                   │
+                   ├─ inner_compile = GraphFusionPassManager(graph)
+                   └─ aot_autograd(fw_compiler=inner_compile)(graph, example_inputs)
+```
+
+[VERIFY: vllm_ascend/compilation/compiler_interface.py:47]
+[VERIFY: vllm_ascend/compilation/compiler_interface.py:149]
+[VERIFY: vllm_ascend/compilation/compiler_interface.py:255]
+
+两条路径的本质区别：
+
+| 维度 | `npugraph_ex_compile` | `fusion_pass_compile` |
+|---|---|---|
+| 编译目标 | NPU 原生可执行代码 | 融合后的 FX graph（eager 执行） |
+| 后端 | npugraph_ex / torchair | AOTAutograd + GraphFusionPassManager |
+| 图融合 | 交给 NPU backend | Ascend 自己的融合 passes |
+| 缓存 | 支持 (py_code 写盘) | 不支持 |
+| 适用场景 | 生产、静态 shape | 调试、fallback |
+
+### 7.5 CUDAGraph 替代：从 CudagraphDispatcher 到 ACLGraphWrapper
+
+vLLM 上游的 CUDAGraph 机制在 Ascend 上有对应的完整替代。**运行时分发的核心思想是
+"预定义离散 capture size + padding + BatchDescriptor 哈希查找"**，
+完全替代了 Dynamo 的 guard-based recompile：
+
+```text
+运行时 forward
+    │
+    ▼
+CudagraphDispatcher.dispatch(num_tokens=4097)
+    │
+    ├─ 1. 查 _bs_to_padded_graph_size[4097] → 填充到 4112
+    │
+    ├─ 2. 构造 BatchDescriptor(num_tokens=4112, num_reqs=..., uniform=...)
+    │
+    ├─ 3. 在预注册的 cudagraph_keys 中查找
+    │    ├─ FULL mode: 精确匹配 BatchDescriptor
+    │    └─ PIECEWISE mode: num_reqs=None 的宽松匹配
+    │
+    ├─ 命中 → (CUDAGraphMode.FULL, batch_descriptor)
+    └─ 未命中 → (CUDAGraphMode.NONE, batch_descriptor)  # eager fallback
+         │
+         ▼
+写入 forward_context (cudagraph_runtime_mode, batch_descriptor)
+         │
+         ▼
+ACLGraphWrapper.__call__(*args)
+    │
+    ├─ mode == NONE → 直接调用 self.runnable(*args)
+    │
+    └─ mode 匹配
+         ├─ batch_descriptor 未捕获 → torch.npu.graph(): runnable(*args)
+         └─ batch_descriptor 已有 entry → entry.aclgraph.replay()
+```
+
+[VERIFY: vllm_ascend/compilation/acl_graph.py:64]
+[VERIFY: vllm_ascend/compilation/acl_graph.py:152]
+[VERIFY: vllm_ascend/worker/model_runner_v1.py:2853]
+[VERIFY: vllm_ascend/worker/model_runner_v1.py:2866]
+
+关键设计点：
+
+- **`BatchDescriptor`** 是一个 `@dataclass(frozen=True)`，字段为
+  `num_tokens`、`num_reqs`、`uniform`、`has_lora`——天然可哈希，
+  直接作为 `dict[BatchDescriptor, ACLGraphEntry]` 的 key。
+
+- **PIECEWISE 模式**下 `num_reqs` 设为 `None`，意味着同一个 token-size 的图
+  可以被不同 request 数目的 batch 复用——这是 piecewise CUDA graph 的关键优势。
+
+- **`ACLGraphWrapper` 的信任模型**：它不负责 padding 或 buffer 管理。
+  它信任外层（CudagraphDispatcher + model_runner）已经选对了
+  `cudagraph_runtime_mode`、`batch_descriptor`、padding 量和输入地址。
+
+### 7.6 CUDAGraph 初始化流程
+
+model runner 初始化时完成 capture sizes 的注册和 ACL graph 的预捕获：
+
+```text
+ModelRunner.__init__()
+    │
+    ├─ 1. 查询 attention backend 的 graph 支持级别
+    ├─ 2. 解析 cudagraph_mode 与 capture_sizes (e.g. [1,2,4,8,...,256])
+    ├─ 3. CudagraphDispatcher.initialize_cudagraph_keys()
+    │      └─ 为每个 (mode, capture_size, lora_count) 创建 BatchDescriptor
+    │        并注册到 cudagraph_keys 集合中
+    ├─ 4. 为 Ascend graph runtime 预分配按 size 索引的
+    │     workspace / event / handle
+    └─ 5. warmup 阶段：遍历 compile_ranges，
+           对每个 capture size 执行一次 fake input forward，
+           触发 ACLGraphWrapper 首次 capture
+```
+
+[VERIFY: vllm_ascend/worker/model_runner_v1.py:4828]
+[VERIFY: vllm_ascend/worker/model_runner_v1.py:4849]
+
+### 7.7 端到端总览
+
+下面把 compilation 编译阶段和 CUDAGraph 运行时分发阶段画在一张图里：
+
+```text
+╔══════════════════════════════════════════════════════════════════╗
+║                    编译阶段（启动时一次性）                       ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  @support_torch_compile                                          ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  TorchDynamo 捕获 → FX Graph (symbolic shape s0)                  ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  VllmBackend.split_graph() → N 个 piecewise 子图                  ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  PiecewiseBackend.compile_all_ranges()                            ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  CompilerManager.compile() ──缓存──▶ AscendCompiler.compile()     ║
+║       │                                      │                    ║
+║       │                        ┌─────────────┴─────────────┐      ║
+║       │                        ▼                           ▼      ║
+║       │               npugraph_ex_compile()      fusion_pass_compile()
+║       │                        │                           │      ║
+║       │                        ▼                           ▼      ║
+║       │               NPU 原生可执行代码          融合后 FX graph    ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  ACLGraphWrapper 包裹 compiled runnable                           ║
+║  warmup 阶段: torch.npu.graph() 首次 capture                       ║
+║                                                                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║                    运行阶段（每次 forward）                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║                                                                  ║
+║  实际 num_tokens = 4097                                          ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  CudagraphDispatcher.dispatch(4097)                               ║
+║       │                                                          ║
+║       ├─ pad 到 4112                                             ║
+║       ├─ BatchDescriptor(4112, num_reqs, ...)                    ║
+║       └─ hash 查找 cudagraph_keys                                ║
+║       │                                                          ║
+║       ├─ 命中 → (FULL/PIECEWISE, descriptor)                     ║
+║       └─ 未命中 → (NONE, descriptor) → eager 执行                ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  写入 forward_context                                             ║
+║       │                                                          ║
+║       ▼                                                          ║
+║  ACLGraphWrapper.__call__()                                       ║
+║       │                                                          ║
+║       ├─ mode NONE → runnable(*args)       # eager               ║
+║       ├─ 首次 capture → npu.graph capture   # 记录                ║
+║       └─ 已有 entry → aclgraph.replay()     # 重放                ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+### 7.8 接入机制总结
+
+vllm-ascend 通过三个层次接入上游 vLLM，每一层都不需要修改上游源码：
+
+1. **平台层**：`entry_point → NPUPlatform`。vLLM 的插件系统通过
+   `vllm.platform_plugins` entry point group 发现 OOT 平台，
+   `NPUPlatform` 覆写三个 classmethod 声明自己的编译器、PassManager、图捕获器。
+
+2. **编译器层**：`CompilerInterface → AscendCompiler`。
+   `make_compiler()` 工厂函数的 `else` 分支通过 `resolve_obj_by_qualname`
+   延迟实例化 `AscendCompiler`；`CompilerManager` 提供缓存和 key 管理；
+   `AscendCompiler.compile()` 内部按配置选择 `npugraph_ex` 或 `fusion_pass` 路径。
+
+3. **运行时分发层**：`CUDAGraph → ACLGraphWrapper`。
+   `CudagraphDispatcher` 把实际 batch size pad 到预定义 capture size，
+   通过 `BatchDescriptor` 哈希查找分派到对应的 `ACLGraphWrapper`；
+   wrapper 内部按需执行 `torch.npu.graph` capture 或 `replay`。
+
+上游 vLLM 文档对这套接入机制的设计意图有明确说明：
+[`Platform.get_compile_backend`](https://github.com/vllm-project/vllm/blob/967c5c3bc38891f4465d3f4e99917ed837bb3833/vllm/platforms/interface.py#L203-L208)
