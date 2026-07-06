@@ -34,6 +34,66 @@ Layer 3: 后端图编译 (npugraph_ex / torchair → ACL Graph)
 | `results/` | benchmark 结果 JSON |
 | `profile/` | torch_npu profiler 数据 |
 
+## Warmup 实验入口
+
+如果你要评估“首个抖动”而不是普通吞吐，直接看 `warmup-exp/`。
+
+### 这个目录适合做什么
+
+- `compile range` 导致的编译抖动
+- `ACLGraph` 首次命中 capture 导致的抖动
+- DBO `on/off` 对首回合抖动的影响
+- `warmup` 是否能把首回合抖动消掉
+
+### 脚本说明
+
+- [`warmup-exp/server.sh`](./warmup-exp/server.sh)：启动实验 server，默认创建全新 `RUN_ID` 和独立 cache
+- [`warmup-exp/test.sh`](./warmup-exp/test.sh)：按固定序列发压，支持 `MODE=observe|warmup`
+
+### 推荐跑法
+
+compile range 抖动：
+
+```bash
+cd testbench/MOE/dbo/demos/compilation-dump/warmup-exp
+EXPERIMENT=compile_range DUMP_MODE=compile DBO=0 bash server.sh
+EXPERIMENT=compile_range MODE=observe bash test.sh
+```
+
+ACLGraph 首次 capture 抖动：
+
+```bash
+cd testbench/MOE/dbo/demos/compilation-dump/warmup-exp
+EXPERIMENT=aclgraph ENABLE_PROFILER=1 DBO=0 bash server.sh
+EXPERIMENT=aclgraph MODE=observe bash test.sh
+```
+
+warmup 对照组：
+
+```bash
+cd testbench/MOE/dbo/demos/compilation-dump/warmup-exp
+EXPERIMENT=compile_range MODE=warmup bash test.sh
+EXPERIMENT=aclgraph MODE=warmup bash test.sh
+```
+
+DBO 对照组：
+
+```bash
+cd testbench/MOE/dbo/demos/compilation-dump/warmup-exp
+EXPERIMENT=aclgraph DBO=0 bash server.sh
+EXPERIMENT=aclgraph DBO=1 bash server.sh
+```
+
+### 为什么必须用干净 cache
+
+这类实验测的是“第一次触发”的额外成本。如果复用旧 cache：
+
+- compile range 可能已经被编译过；
+- ACLGraph bucket 可能已经被 capture 过；
+- 你看到的就不再是首回合抖动，而是稳态 replay。
+
+因此默认必须让每次 server 启动生成新的 `RUN_ID`，不要手动复用旧的 `cache/<RUN_ID>/`。
+
 ## 快速开始
 
 ### 1. 最小验证（单请求，确认能跑通）
