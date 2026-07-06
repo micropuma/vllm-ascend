@@ -415,7 +415,83 @@ ubatch0_size == ubatch1_size
 当前实现应明确维持“两个 ubatch 等长”的 invariant，或者改造 graph key 和
 capture/replay contract。
 
-## 11. 总结
+## 11. Q9：piecewise compilation 的 range 是怎么定的？
+
+piecewise compilation 的 range 不是运行时临时推出来的，而是在启动初始化阶段由
+`CompilationConfig` 里的 `compile_ranges_endpoints` 决定，然后再被 Ascend 平台按融合
+规则做一次补充。
+
+源码里对应的入口是：
+
+- `vllm_ascend/ascend_config.py::_get_compile_ranges()`：直接读取
+  `compilation_config.compile_ranges_endpoints`
+- `vllm_ascend/ascend_config.py::update_compile_ranges_split_points()`：在启用
+  `fuse_allreduce_rms` 时，额外把 `ALLREDUCE_NORM_FUSE_THRESHOLD` append 进去
+- `vllm_ascend/worker/worker.py::compile_or_warm_up_model()`：遍历这些 range，
+  如果当前 warmup size / cudagraph size 没覆盖某个 range，就补一个
+  `compile_range.end` 做 dummy run
+
+也就是说，piecewise 的 range 决定因素是：
+
+1. 用户或平台最终写入的 `compile_ranges_endpoints`
+2. Ascend 为 matmul / allreduce 融合追加的阈值
+3. worker 在 warmup 阶段为了覆盖未命中的 range 所做的补跑
+
+这意味着：
+
+- piecewise compile 的“range”是编译/预热用的离散区间；
+- 它不是 ACLGraph 的 bucket；
+- 它解决的是“哪些 FX partition 需要被编译到”，不是“运行时怎么把 size 归桶”。
+
+## 12. Q10：ACLGraph 的 bucket 是怎么定的？
+
+ACLGraph 的 bucket 不是连续值，而是由 `cudagraph_capture_sizes` 定义的一组离散边界。
+真正起作用的映射表是在 `CudagraphDispatcher.initialize_cudagraph_keys()` 中预计算出来的。
+
+关键逻辑是：
+
+```python
+self._bs_to_padded_graph_size = [0] * (max_size + 1)
+for end, start in zip(capture_sizes + [max_size + 1], [0] + capture_sizes):
+    for bs in range(start, end):
+        if bs == start:
+            self._bs_to_padded_graph_size[bs] = start
+        else:
+            self._bs_to_padded_graph_size[bs] = end
+```
+
+含义是：
+
+- `capture_sizes` 里的数值本身就是 bucket 边界；
+- 任意真实 `bs` 会先被映射到某个 padded graph size；
+- `BatchDescriptor` 使用的是 padded 值，不是原始值；
+- `ACLGraphWrapper` 以及 `FULL` 模式的 `npu_ubatch_wrapper` 都按这个 padded 值做
+  exact match / replay。
+
+因此 bucket 逻辑可以理解成：
+
+```text
+raw num_tokens
+  -> _bs_to_padded_graph_size[num_tokens]
+  -> BatchDescriptor(num_tokens=padded_value)
+  -> ACLGraph key exact match
+```
+
+这和 piecewise compilation 的 range 不同：
+
+- piecewise range 解决“FX 图怎么切、哪些区间需要编译”；
+- ACLGraph bucket 解决“运行时 token size 怎么映射到可重放的 graph key”。
+
+如果没有显式配置 `cudagraph_capture_sizes`，上游 vLLM 会用默认模式生成：
+
+```text
+[1, 2, 4] + range(8, 256, 8) + range(256, max_cudagraph_capture_size + 1, 16)
+```
+
+而 Ascend 侧默认 `max_cudagraph_capture_size` 还会跟 `max_num_seqs * decode_query_len`
+绑定，并在没有显式配置时取较小者；如果 TP/SP 需要，还会进一步裁剪或重写。
+
+## 13. 总结
 
 | 图或执行层次 | 图的粒度 | 是否包含两个 ubatch | replay 是否依赖 DBO Python 线程 |
 |---|---|---:|---:|
