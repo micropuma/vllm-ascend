@@ -61,7 +61,7 @@ mkdir -p \
 # ------------------------------------------------------------
 
 # 推荐 AI_CPU：尽量避免 HCCL 通信占用 AI Core / AI Vector 计算资源
-export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AI_CPU}
+export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AIV}
 
 # TODO(leon)：目前flashcomm1/flashcomm2在dbo下和torch compile不兼容，先默认关闭
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}
@@ -108,7 +108,7 @@ DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-1000000000}
 # ------------------------------------------------------------
 ENABLE_PROFILER=${ENABLE_PROFILER:-0}
 PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
-TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/dbo_profile}
+TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/${LABEL:-dbo}_profile}
 
 # profiler 时建议小一点，避免 trace 爆炸
 PROFILER_MAX_ITERATIONS=${PROFILER_MAX_ITERATIONS:-20}
