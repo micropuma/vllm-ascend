@@ -31,6 +31,7 @@ run_case() {
   local tag="$4"
   local run_id
   run_id="$(date +%Y%m%d_%H%M%S)_${tag}"
+  local server_pid=""
 
   echo ""
   echo "============================================================"
@@ -50,10 +51,18 @@ run_case() {
     DBO="$dbo" \
     MODE="$mode" \
     RUN_ID="$run_id" \
-    bash "$SCRIPT_DIR/server.sh" &
+    setsid bash "$SCRIPT_DIR/server.sh" &
 
-  local server_pid=$!
-  trap 'kill "${server_pid}" >/dev/null 2>&1 || true' EXIT
+  server_pid=$!
+
+  cleanup_server() {
+    if [[ -n "$server_pid" ]]; then
+      kill -TERM -"${server_pid}" >/dev/null 2>&1 || true
+      sleep 5
+      kill -KILL -"${server_pid}" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup_server EXIT
 
   sleep "$SERVER_WAIT"
 
@@ -64,10 +73,11 @@ run_case() {
     EXPERIMENT="$experiment" \
     MODE="$mode" \
     RUN_ID="$run_id" \
+    SEQUENCE="" \
     LABEL="$tag" \
     bash "$SCRIPT_DIR/test.sh" || true
 
-  kill "$server_pid" >/dev/null 2>&1 || true
+  cleanup_server
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - EXIT
 

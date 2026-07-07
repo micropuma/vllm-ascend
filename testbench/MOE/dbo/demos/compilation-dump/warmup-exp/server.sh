@@ -108,7 +108,7 @@ case "$DUMP_MODE" in
         ;;
     backend)
         unset TORCH_TRACE
-        export TORCH_LOGS=""
+        unset TORCH_LOGS
         export VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE=1
         DUMP_DESC="backend AOT only"
         ;;
@@ -120,7 +120,7 @@ case "$DUMP_MODE" in
         ;;
     none|*)
         unset TORCH_TRACE
-        export TORCH_LOGS=""
+        unset TORCH_LOGS
         DUMP_DESC="none"
         ;;
 esac
