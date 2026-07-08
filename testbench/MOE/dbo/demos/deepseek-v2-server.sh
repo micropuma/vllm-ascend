@@ -156,6 +156,7 @@ serve_args=(
   --port "$PORT"
 
   --dtype bfloat16
+  --generation-config vllm
 
   --distributed-executor-backend mp
   --tensor-parallel-size "$TP"

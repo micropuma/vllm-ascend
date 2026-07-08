@@ -121,7 +121,7 @@ case "$DUMP_MODE" in
     none|*)
         unset TORCH_TRACE
         unset TORCH_LOGS
-        DUMP_DESC="none"
+        DUMP_DESC="none (cold boot only, no dump overhead)"
         ;;
 esac
 
