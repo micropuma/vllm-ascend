@@ -37,7 +37,10 @@ SAVE_DETAILED=${SAVE_DETAILED:-0}
 # 每个 step 都是固定输入长度，便于观察 first-hit vs replay。
 case "$EXPERIMENT" in
     compile_range)
-        SEQUENCE=${SEQUENCE:-"1023,1024,1025,2047,2048,2049,4095,4096,4097,8191,8192,8193,16383,16384,16385"}
+        # 这个模型的最大上下文是 8192，所以默认只探测到 8192 边界；
+        # 但 chat template 会额外吃掉 token，默认不把 8192 放进实验组，
+        # 避免因为模板膨胀导致请求直接超限。
+        SEQUENCE=${SEQUENCE:-"1023,1024,1025,2047,2048,2049,4095,4096,4097,8191"}
         ;;
     aclgraph)
         SEQUENCE=${SEQUENCE:-"15,16,17,31,32,33,63,64,65,127,128,129,255,256"}
@@ -152,4 +155,3 @@ run_sequence "formal" "$SEQUENCE"
 
 echo ""
 echo "  ✓ All results saved under ${OUT_DIR}" | tee -a "$TEST_LOG"
-
