@@ -1,0 +1,14 @@
+name: gpqa_diamond
+adapter: gpqa
+dataset_path: /data/datasets/gpqa/gpqa_diamond
+split: train
+num_fewshot: 0
+max_samples: null
+generation:
+  max_tokens: 8
+  temperature: 0.0
+  top_p: 1.0
+  seed: 42
+system_prompt: >-
+  Answer the multiple-choice question. Reply with only the single correct
+  option letter: A, B, C, or D.

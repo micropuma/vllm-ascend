@@ -1,0 +1,15 @@
+name: gsm8k
+adapter: gsm8k
+dataset_path: /data/datasets/gsm8k
+split: test
+fewshot_split: train
+num_fewshot: 5
+max_samples: null
+generation:
+  max_tokens: 512
+  temperature: 0.0
+  top_p: 1.0
+  seed: 42
+system_prompt: >-
+  Solve each math problem carefully. End the response with the exact final
+  answer in the form "#### <number>".

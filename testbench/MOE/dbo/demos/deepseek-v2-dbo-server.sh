@@ -61,7 +61,7 @@ mkdir -p \
 # ------------------------------------------------------------
 
 # 推荐 AI_CPU：尽量避免 HCCL 通信占用 AI Core / AI Vector 计算资源
-export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AIV}
+export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AI_CPU}
 
 # TODO(leon)：目前flashcomm1/flashcomm2在dbo下和torch compile不兼容，先默认关闭
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1:-1}
