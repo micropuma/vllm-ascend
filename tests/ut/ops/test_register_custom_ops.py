@@ -43,6 +43,28 @@ def test_maybe_chunk_residual_keeps_matching_shape(*_mocks):
     assert chunked is residual
 
 
+@patch("vllm_ascend.ops.register_custom_ops._FLASH_COMM_V1_SNAPSHOT", False)
+@patch("vllm_ascend.ops.register_custom_ops.enable_sp_by_pass", return_value=True)
+@patch("vllm_ascend.ops.register_custom_ops.get_tensor_model_parallel_world_size", return_value=2)
+def test_maybe_pad_and_reduce_fake_keeps_non_ep_shape(*_mocks):
+    x = torch.empty(5, 16)
+
+    output = register_custom_ops._maybe_pad_and_reduce_fake(x, is_ep_comm=False)
+
+    assert output.shape == x.shape
+
+
+@patch("vllm_ascend.ops.register_custom_ops._FLASH_COMM_V1_SNAPSHOT", False)
+@patch("vllm_ascend.ops.register_custom_ops.enable_sp_by_pass", return_value=True)
+@patch("vllm_ascend.ops.register_custom_ops.get_tensor_model_parallel_world_size", return_value=2)
+def test_maybe_pad_and_reduce_fake_reduces_ep_shape(*_mocks):
+    x = torch.empty(5, 16)
+
+    output = register_custom_ops._maybe_pad_and_reduce_fake(x, is_ep_comm=True)
+
+    assert output.shape == (3, 16)
+
+
 def test_resolve_mla_forward_inputs_keeps_non_vl_output_global():
     hidden_states = torch.randn(4096, 16)
 

@@ -218,7 +218,7 @@ def _get_reduce_scatter_num_tokens(num_tokens: int, tp_size: int) -> int:
 
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False, do_comm: bool = True) -> torch.Tensor:
-    if (_FLASH_COMM_V1_SNAPSHOT or enable_sp_by_pass()) and do_comm:
+    if (_FLASH_COMM_V1_SNAPSHOT or (enable_sp_by_pass() and is_ep_comm)) and do_comm:
         tp_size = get_tensor_model_parallel_world_size()
         num_tokens = _get_reduce_scatter_num_tokens(x.shape[0], tp_size)
         return torch.empty((num_tokens, *x.shape[1:]), device=x.device, dtype=x.dtype)

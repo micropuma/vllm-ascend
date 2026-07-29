@@ -403,7 +403,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                     padded_length = 0
 
                 torch.ops.vllm.dbo_moe_prepare_hook(hidden_states, is_record=True)
-                if flash_comm_enabled:
+                # SP pass leaves MoE inputs sequence-sharded, so they also need all-gather.
+                if flash_comm_enabled or enable_sp_by_pass():
                     if use_ep_comm:
                         hidden_states = get_ep_group().all_gather(hidden_states, 0)
                         router_logits = get_ep_group().all_gather(router_logits, 0)
