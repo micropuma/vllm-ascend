@@ -376,7 +376,7 @@ def _maybe_all_gather_and_maybe_unpad_fake(x, label, is_ep_comm=False, do_comm=T
     return x  # identity
 
 # 改造后：
-def _maybe_all_gather_and_maybe_unpad_fake(x, label, is_ep_comm=False, do_comm=True, 
+def _maybe_all_gather_and_maybe_unpad_fake(x, label, is_ep_comm=False, do_comm=True,
                                             flash_comm_enabled=False, tp_size=1):
     if flash_comm_enabled and label and do_comm:
         return torch.empty(
@@ -392,7 +392,7 @@ hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, T
 
 # 改造后：
 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
-    hidden_states, True, True, 
+    hidden_states, True, True,
     flash_comm_enabled=_EXTRA_CTX.flash_comm_v1_enabled,
     tp_size=get_tensor_model_parallel_world_size()
 )
@@ -774,7 +774,7 @@ def _register_ubatch_function(func):
        if _FLASH_COMM_V1_SNAPSHOT:
            num_tokens = num_tokens // tp_size
        return torch.empty(
-           (num_tokens, input_parallel.size(1) // tp_size), 
+           (num_tokens, input_parallel.size(1) // tp_size),
            device=input_parallel.device, dtype=input_parallel.dtype
        )
    ```

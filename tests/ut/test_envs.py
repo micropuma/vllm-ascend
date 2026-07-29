@@ -14,6 +14,7 @@
 
 import inspect
 import os
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
@@ -35,7 +36,10 @@ class TestEnvVariables(TestBase):
                     self.assertEqual(getattr(envs_ascend, var_name), var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if "int(" in handler_source:
+                    if var_name in {
+                        "VLLM_ASCEND_DBO_COMM_AIC_NUM",
+                        "VLLM_ASCEND_DBO_COMM_AIV_NUM",
+                    } or "int(" in handler_source:
                         test_vals = ["123", "456"]
                     elif "bool(int(" in handler_source:
                         test_vals = ["0", "1"]
@@ -57,3 +61,21 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_dbo_comm_core_counts_reject_values_below_minus_one(self):
+        for var_name in (
+            "VLLM_ASCEND_DBO_COMM_AIC_NUM",
+            "VLLM_ASCEND_DBO_COMM_AIV_NUM",
+        ):
+            with self.subTest(var=var_name), patch.dict(os.environ, {var_name: "-2"}):
+                with self.assertRaisesRegex(ValueError, "must be -1 or a non-negative integer"):
+                    getattr(envs_ascend, var_name)
+
+    def test_dbo_comm_core_counts_reject_non_integers(self):
+        for var_name in (
+            "VLLM_ASCEND_DBO_COMM_AIC_NUM",
+            "VLLM_ASCEND_DBO_COMM_AIV_NUM",
+        ):
+            with self.subTest(var=var_name), patch.dict(os.environ, {var_name: "invalid"}):
+                with self.assertRaises(ValueError):
+                    getattr(envs_ascend, var_name)

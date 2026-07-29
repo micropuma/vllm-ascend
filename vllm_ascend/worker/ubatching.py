@@ -12,9 +12,12 @@ from vllm.v1.worker.ubatching import UBatchContext
 from vllm_ascend import envs
 from vllm_ascend.utils import dbo_current_stream, dbo_set_stream
 
+DBO_NUM_UBATCHES = 2
+
 _THREAD_ID_TO_CONTEXT: dict = {}
-# Here we hardcode the number of microbatches to 2 for default.
-_NUM_UBATCHES: int = 2
+# TODO(leon): Ascend DBO currently supports only dual microbatching. Keep this
+# configurable for future support
+_NUM_UBATCHES: int = DBO_NUM_UBATCHES
 _CURRENT_CONTEXTS: list[Optional["UBatchContext"]] = []
 
 
@@ -233,7 +236,8 @@ def make_ubatch_contexts(
     schedule: str = "default",
 ) -> list[AscendUBatchContext]:
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
-    assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
+    if num_micro_batches != DBO_NUM_UBATCHES:
+        raise ValueError(f"Ascend DBO supports exactly {DBO_NUM_UBATCHES} microbatches, got {num_micro_batches}.")
 
     _NUM_UBATCHES = num_micro_batches
     # Ensure the global context list is large enough

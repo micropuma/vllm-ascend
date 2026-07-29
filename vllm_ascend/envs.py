@@ -22,6 +22,14 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _get_dbo_comm_core_count(name: str) -> int:
+    value = int(os.getenv(name, "-1"))
+    if value < -1:
+        raise ValueError(f"{name} must be -1 or a non-negative integer, got {value}")
+    return value
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -110,13 +118,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # DBO communication configuration: number of AIC (AI Core) streams for DBO
-    "VLLM_ASCEND_DBO_COMM_AIC_NUM": lambda: int(os.getenv("VLLM_ASCEND_DBO_COMM_AIC_NUM", "-1")),
-    # Set the ai cube core num for the communication block when enabling dbo
-    "VLLM_ASCEND_DBO_COMM_AIC_NUM": lambda: int(os.getenv("VLLM_ASCEND_DBO_COMM_AIC_NUM", -1)),
-    # Set the ai vector core num for the communication block when enabling dbo,
-    # should greater than 16 for HCCL kernels
-    "VLLM_ASCEND_DBO_COMM_AIV_NUM": lambda: int(os.getenv("VLLM_ASCEND_DBO_COMM_AIV_NUM", -1)),
+    # DBO communication AIC core count. -1 (default) disables core partitioning;
+    # otherwise use a non-negative value below the device cube-core count. Not sensitive.
+    "VLLM_ASCEND_DBO_COMM_AIC_NUM": lambda: _get_dbo_comm_core_count("VLLM_ASCEND_DBO_COMM_AIC_NUM"),
+    # DBO communication AIV core count. -1 (default) disables core partitioning;
+    # otherwise use a non-negative value below the device vector-core count. Not sensitive.
+    "VLLM_ASCEND_DBO_COMM_AIV_NUM": lambda: _get_dbo_comm_core_count("VLLM_ASCEND_DBO_COMM_AIV_NUM"),
 }
 
 # end-env-vars-definition

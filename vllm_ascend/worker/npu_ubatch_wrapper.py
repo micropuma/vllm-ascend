@@ -19,7 +19,14 @@ from vllm_ascend.ascend_forward_context import create_ascend_forward_context
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.dbo.utils import select_dbo_templates
 from vllm_ascend.utils import dbo_current_stream, enable_sp
-from vllm_ascend.worker.ubatching import dbo_yield, make_ubatch_contexts
+from vllm_ascend.worker.ubatching import DBO_NUM_UBATCHES, dbo_yield, make_ubatch_contexts
+
+
+def validate_dbo_num_ubatches(num_ubatches: int) -> None:
+    if num_ubatches != DBO_NUM_UBATCHES:
+        raise ValueError(
+            f"Ascend DBO supports exactly {DBO_NUM_UBATCHES} microbatches, got {num_ubatches}."
+        )
 
 
 @dataclass
@@ -98,13 +105,9 @@ class AscendUBatchWrapper(UBatchWrapper):
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.comm_stream = torch.npu.Stream(device=device)
-        # Ubatch threads plus the main thread
-        # TODO(zxdu): update it at v0.14.0
-        if hasattr(self.vllm_config.parallel_config, "num_ubatches"):
-            num_ubatches = self.vllm_config.parallel_config.num_ubatches
-        else:
-            num_ubatches = 2
-        self.ready_barrier = threading.Barrier(num_ubatches + 1)
+        num_ubatches = getattr(self.vllm_config.parallel_config, "num_ubatches", DBO_NUM_UBATCHES)
+        validate_dbo_num_ubatches(num_ubatches)
+        self.ready_barrier = threading.Barrier(DBO_NUM_UBATCHES + 1)
 
         self.cudagraphs: dict[int, AscendNPUGraphMetaData] = {}
 

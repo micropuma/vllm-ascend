@@ -188,10 +188,10 @@ compile_range 实验中，`range_end − 1` 位置（2047, 4095）出现 3-4x �
 | Free/idle | 15.2% | **8.6%** |
 | FC2 兼容 | ❌ CANN crash | ✅ |
 
-基于torch profile捕获出的profile结果可知，AI_CPU 和 AIV有如下tradeoff：  
+基于torch profile捕获出的profile结果可知，AI_CPU 和 AIV有如下tradeoff：
 
-* AIV会导致计算kernel变慢  
-* AI_CPU会导致通信时间发生明显抖动异常  
+* AIV会导致计算kernel变慢
+* AI_CPU会导致通信时间发生明显抖动异常
 
 **深度分析见**请参考 [`profile-deep-analysis-4way.md`](profile-deep-analysis-4way.md) ，涵盖 AI_CPU vs AIV 的权威 profiling 分析，包含 kernel 级对比、async 开销根因、DBO cascade 放大、Profiling vs TTFT 矛盾解释、MindStudio 定位方法。
 

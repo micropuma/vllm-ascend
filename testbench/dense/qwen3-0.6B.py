@@ -2,7 +2,7 @@ from vllm import LLM, SamplingParams
 
 '''
     参考 https://github.com/vllm-project/vllm-ascend/issues/414
-    * 设置 VLLM_WORKER_MULTIPROC_METHOD=spawn  
+    * 设置 VLLM_WORKER_MULTIPROC_METHOD=spawn
     * 将 LLM 对象的创建放在 if __name__ == "__main__": 下面
 '''
 

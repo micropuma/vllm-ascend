@@ -187,4 +187,3 @@ export VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED=0
 
 - `../bug/ai_cpu.md`
 - `/data/workspace/codex-dbo-analysis-20260627/`
-

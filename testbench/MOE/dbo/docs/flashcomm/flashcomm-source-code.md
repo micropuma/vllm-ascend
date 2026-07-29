@@ -129,9 +129,9 @@ forward_context.flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1
 
 几个关键判断逻辑：
 
-- **MoE 模型**：`num_tokens is not None` 即开启，不要求 `> 1000`。因为 MoE 场景的通信融合收益与 token 数无关。   
-    > 关键是MOE的模型结构天然适配 flashcomm：具有较强的模型结构属性：  
-    > * 减少 TP rank 上重复的 RMSNorm、Router、Quant；  
+- **MoE 模型**：`num_tokens is not None` 即开启，不要求 `> 1000`。因为 MoE 场景的通信融合收益与 token 数无关。
+    > 关键是MOE的模型结构天然适配 flashcomm：具有较强的模型结构属性：
+    > * 减少 TP rank 上重复的 RMSNorm、Router、Quant；
     > * 减少两级 collective 的启动和同步（统一TP,DP,EP三层通信域）；
     > * 避免先恢复 TP replicated，再重新进入 EP 布局；
     > * MoE 输出直接回到 sequence-sharded 状态。
@@ -619,5 +619,5 @@ FlashComm1 路径:
 | `vllm_ascend/ops/flashcomm2_oshard_manager.py` | FlashComm2 O-Shard 管理 | :1-101 |
 | `vllm_ascend/worker/model_runner_v1.py` | 模型输出后 all_gather 恢复全量 | :2588-2593 |
 
-## 参考资料  
+## 参考资料
 1. [vllm-ascend通信优化](https://hwcomputing.csdn.net/6a0d698b10ee7a33f273e68c.html)

@@ -10,11 +10,11 @@ os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"          # 允许跨平面通信
 # 将各种缓存目录重定向到 /data（空间充足）
 os.environ["TORCH_EXTENSIONS_DIR"] = "/data/torch_cache"
 os.environ["VLLM_CACHE_DIR"] = "/data/vllm_cache"
-os.environ["TRITON_CACHE_DIR"] = "/data/triton_cache"  
+os.environ["TRITON_CACHE_DIR"] = "/data/triton_cache"
 os.environ["HF_HOME"] = "/data/huggingface_cache"
 os.environ["TMPDIR"] = "/data/tmp"
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/data/torch_inductor_cache"
-os.environ["VLLM_COMPILE_CACHE_PATH"] = "/data/vllm_compile_cache"  
+os.environ["VLLM_COMPILE_CACHE_PATH"] = "/data/vllm_compile_cache"
 
 # 创建所有缓存目录
 for d in ["/data/torch_cache", "/data/vllm_cache", "/data/triton_cache",

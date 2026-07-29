@@ -218,7 +218,7 @@ self.compile_all_ranges()
 - [../../vllm-dly/vllm/compilation/backends.py](../../vllm-dly/vllm/compilation/backends.py)
   - `PiecewiseCompileInterpreter.call_module`
 
-这里是 piecewise compile 的核心调度点。  
+这里是 piecewise compile 的核心调度点。
 它会在访问某个 submodule 时创建：
 
 ```python
@@ -368,4 +368,3 @@ if self.graph is not None:
 | runtime group/stream | `get_ep_group()`, `get_dp_group()`, HCCL group, stream switch |              fake impl 不能读 | 只放 real impl                              |
 | runtime 特例           | `is_draft_model`, `is_vl_model`, per-step 状态                  |            fake impl 不能隐式读 | 显式参数化，或静态化为 module attr                   |
 | 真实通信副作用              | `all_gather`, `reduce_scatter`, `all_reduce`                  |             fake impl 不能执行 | fake 只返回 empty tensor metadata            |
-

@@ -267,4 +267,3 @@ Ascend 更难，是因为它要同时满足：
 4. 不支持 async/receiver 语义的通信路径，不应该强行启用 DBO。
 
 上游能跑通，是因为它基本遵守了这些边界。Ascend 现在难，是因为 DBO + FlashComm 的插桩已经扩散到普通 forward path，同时 fake impl 又读取 runtime context，导致 compile 的每一层机制都会撞到动态状态。
-

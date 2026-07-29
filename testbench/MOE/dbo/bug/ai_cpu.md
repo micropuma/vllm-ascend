@@ -88,13 +88,13 @@ bash deepseek-v2-dbo-test.sh
 
 该矩阵排除了以下假设：
 
-1. **不是 FlashComm1 MLA AllGather 单独导致。**  
+1. **不是 FlashComm1 MLA AllGather 单独导致。**
    DBO + FlashComm1 在完整压力下稳定通过。
 
-2. **不是 O-Shard 的异步权重 broadcast 单独导致。**  
+2. **不是 O-Shard 的异步权重 broadcast 单独导致。**
    关闭 O-Shard、保留 FlashComm2 后仍然复现。
 
-3. **不是 FIA 算子本身首先失败。**  
+3. **不是 FIA 算子本身首先失败。**
    FIA、MatMul、Abs 等算子只是异步检测到已经发生的 device error。
 
 ## 故障证据

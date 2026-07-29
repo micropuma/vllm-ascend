@@ -10,11 +10,11 @@
 
 ---
 
-## TLDR  
+## TLDR
 
 > 传统通信并行分为：TP + DP + EP + SP。而华为通信算子库分为：Flashcomm1 + Flashcomm2 + Flashcomm3。并行算法 和 华为通信优化是正交的，排列组合分析对于模型推理性能影响比较困难，也难以理解。 此部分以TP 和 MOE模型 为例，解析flashcomm通信库的作用。
 
-### TP并行 + flashcomm通信优化  
+### TP并行 + flashcomm通信优化
 #### 传统TP做了什么？
 
    ```shell
@@ -43,14 +43,14 @@
    完整 Attention output
    ```
 
-   理解如下规律：  
+   理解如下规律：
 
    * 每个TP rank拿到完整的输入token。
    * QKV projection对Wqkv做列划分，因为该计算只用all gather语义（concat即可，实际不用all gather，因为后续attn可以沿用）。
    * attn实际计算是多头的，之前的**QKV project切分不会破坏多头粒度，所以省去一次 all gather**。
    * O projection需要对所有头做统一的矩阵乘。所以使用行划分。列划分 乘以 行划分，需要all reduce。
 
-### flashcommv1做了什么？  
+### flashcommv1做了什么？
 
 * 分析传统TP的劣势：
 
@@ -58,15 +58,15 @@
 
 * flashcommv1做了什么：
 
-   > * 在模型forward中，有很多诸如rmsnorm或是量化操作，大多是per token操作。 对于传统TP，在all reduce后每个rank持有完整token，引入大量重复运算。   
-   > * flashcomm1将一次完整all reduce 拆分成 all gather + reduce scatter。通过分析model forward链路，发现是qkv projection后，需要全局token（attn注意力模块），所以all gather插入qkv projection后。  
+   > * 在模型forward中，有很多诸如rmsnorm或是量化操作，大多是per token操作。 对于传统TP，在all reduce后每个rank持有完整token，引入大量重复运算。
+   > * flashcomm1将一次完整all reduce 拆分成 all gather + reduce scatter。通过分析model forward链路，发现是qkv projection后，需要全局token（attn注意力模块），所以all gather插入qkv projection后。
 
-* 优势是：      
+* 优势是：
    > 在传统 Megatron-style Tensor Parallel 中，Transformer 子层边界处的 hidden states 通常在同一 TP group 内保持 replicated：每个 TP rank 都持有其所属 DP replica 当前 batch 的全部 token，以及每个 token 的完整 hidden vector。因此，位于这些边界上的 RMSNorm、per-token dynamic quant、部分压缩映射等 token-local 操作，可能在所有 TP rank 上重复执行。
 
    > FlashComm1 将 row-parallel 层后的 AllReduce 改为沿 token 维的 ReduceScatter，使每个 TP rank 只保留部分 token、但仍持有这些 token 的完整 hidden vector。这样，RMSNorm、per-token quant 等操作可以在本地 token shard 上执行；直到下一次 column-parallel 层真正需要全部 token 时，再执行 AllGather。
 
-如下图是完整的链路：  
+如下图是完整的链路：
 
 ```shell
 X：sequence-sharded
@@ -102,7 +102,7 @@ Y：sequence-sharded [T/P,H]
 Local Residual Add
 ```
 
-#### 对于MOE模型有什么作用？  
+#### 对于MOE模型有什么作用？
 
 MoE 与 Attention 的总体思想相同：
 
@@ -113,7 +113,7 @@ MoE 与 Attention 的总体思想相同：
    * MoE 使用 EP AllGather；
    * MoE 结束后使用 EP ReduceScatter。
 
-这里重点讨论一下 TP + DP + EP的all gather问题。 
+这里重点讨论一下 TP + DP + EP的all gather问题。
 
 ### flashcommv2做了什么？
 
@@ -263,9 +263,9 @@ FlashComm2 的 weight 输入维度从 `H_h/TP` 扩展为 `odp * H_h/TP`，即扩
 | Weight 存储 | H_h/TP × H_out/TP | odp×H_h/TP × H_out/otp (O-Shard 可分担) |
 | 本质 | TP 计算 + TP 通信 | DP 计算 + 小组合通信 |
 
-#### O Shard优化  
+#### O Shard优化
 
-> TLDR: FlashComm2 OShared 是一套 O-Proj 权重的 layer-sharding 和 runtime prefetch/broadcast 机制。它不减少 ODP AllToAll，也不改变 FlashComm2 的矩阵乘数学语义；它只是用额外的权重通信和更复杂的 stream/event 管理，换取更低的单卡权重常驻显存。  
+> TLDR: FlashComm2 OShared 是一套 O-Proj 权重的 layer-sharding 和 runtime prefetch/broadcast 机制。它不减少 ODP AllToAll，也不改变 FlashComm2 的矩阵乘数学语义；它只是用额外的权重通信和更复杂的 stream/event 管理，换取更低的单卡权重常驻显存。
 
 ```shell
 FlashComm2 OShared / O-Shard
@@ -665,5 +665,3 @@ DP RS + TP RS → EP RS
 因此，FlashCommV1 在 MoE 场景中的核心作用是：
 
 > 让 Attention 输出的 TP token shard 直接衔接 MoE 的 EP 通信，避免先恢复 TP replicated 状态，再重新进行 DP/EP 数据分发。
- 
-

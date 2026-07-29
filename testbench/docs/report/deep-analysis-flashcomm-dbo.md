@@ -154,7 +154,7 @@ ubatch[0] stream:
                                                          ↑                              ↓
 ubatch[1] stream:                                          │                              │
   ──wait ATTN_PRE──→ [ C₁ ] [   K₁   ] [ C₂ ] ──record ATTN_POST──→ [ K₂ ] [ C₃ ] [   K₃   ] [ C₄ ] ──
-       ↑                                                                                                    
+       ↑
        └── ubatch[0]'s C₄ (EP RS) + ubatch[1]'s C₁ (MLA AG) 与
            ubatch[1]'s K₁+K₂ (Attn + Norm/Route) 重叠
 ```

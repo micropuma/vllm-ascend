@@ -43,49 +43,37 @@ def test_maybe_chunk_residual_keeps_matching_shape(*_mocks):
     assert chunked is residual
 
 
-def test_resolve_mla_forward_inputs_uses_local_flashcomm_token_count():
+def test_resolve_mla_forward_inputs_keeps_non_vl_output_global():
     hidden_states = torch.randn(4096, 16)
 
-    with (
-        patch("vllm_ascend.ops.mla._EXTRA_CTX._ctx", return_value=type("ExtraCtx", (), {"num_tokens": 8})()),
-        patch("vllm_ascend.ops.mla.get_forward_context", return_value=type("Ctx", (), {"num_tokens": 8})()),
-    ):
-        resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
-            hidden_states, flash_comm_v1_enabled=True, tp_size=2, is_vl_first_layer=False
-        )
+    resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
+        hidden_states, flash_comm_v1_enabled=True, tp_size=2, is_vl_first_layer=False
+    )
 
     assert resolved_hidden_states.shape == (4096, 16)
-    assert output_tokens == 4
+    assert output_tokens == 4096
     assert need_gather_q_kv is True
 
 
 def test_resolve_mla_forward_inputs_keeps_vl_first_layer_output_local():
     hidden_states = torch.randn(8, 16)
 
-    with (
-        patch("vllm_ascend.ops.mla._EXTRA_CTX._ctx", return_value=type("ExtraCtx", (), {"num_tokens": 8})()),
-        patch("vllm_ascend.ops.mla.get_forward_context", return_value=type("Ctx", (), {"num_tokens": 8})()),
-    ):
-        resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
-            hidden_states, flash_comm_v1_enabled=True, tp_size=2, is_vl_first_layer=True
-        )
+    resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
+        hidden_states, flash_comm_v1_enabled=True, tp_size=2, is_vl_first_layer=True
+    )
 
     assert resolved_hidden_states.shape == (8, 16)
     assert output_tokens == 4
     assert need_gather_q_kv is False
 
 
-def test_resolve_mla_forward_inputs_falls_back_to_forward_context_num_tokens():
+def test_resolve_mla_forward_inputs_disables_gather_without_flashcomm():
     hidden_states = torch.randn(4096, 16)
 
-    with (
-        patch("vllm_ascend.ops.mla._EXTRA_CTX._ctx", return_value=type("ExtraCtx", (), {"num_tokens": None})()),
-        patch("vllm_ascend.ops.mla.get_forward_context", return_value=type("Ctx", (), {"num_tokens": 16})()),
-    ):
-        resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
-            hidden_states, flash_comm_v1_enabled=True, tp_size=2, is_vl_first_layer=False
-        )
+    resolved_hidden_states, output_tokens, need_gather_q_kv = _resolve_mla_forward_inputs(
+        hidden_states, flash_comm_v1_enabled=False, tp_size=2, is_vl_first_layer=False
+    )
 
     assert resolved_hidden_states.shape == (4096, 16)
-    assert output_tokens == 8
-    assert need_gather_q_kv is True
+    assert output_tokens == 4096
+    assert need_gather_q_kv is False

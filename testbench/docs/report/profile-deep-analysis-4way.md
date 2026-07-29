@@ -84,7 +84,7 @@ Block C:  MoE Finalize RS → 与 Expert compute overlap
 
 #### Step 3: Principle 2 — 计算-通信平衡
 
-| Overlap 区间 | ubatch0 通信块 | ubatch1 计算 | 
+| Overlap 区间 | ubatch0 通信块 | ubatch1 计算 |
 |---|---:|---:|
 | ATTN_PRE | Block A: MLA AG | MLA compute |
 | ATTN_POST | Block B: o_proj RS + MoE Prep AG | MLA compute + 部分 Expert |
@@ -242,11 +242,11 @@ AIV 模式下，HCCL 通信跑在 NPU Vector 核上，与 compute kernel 共享�
 - **纯 Vector kernel** → AIV 不慢（SwiGlu 0.96x, AddRmsNormBias 1.00x），大家在同一个 Vector pool 公平竞争
 - **Cube 主导 kernel** → AIV 略慢（GroupedMatmul 1.08x），影响小
 
-### 3.3 AI_CPU 为什么有 Stall：串行资源瓶颈 
+### 3.3 AI_CPU 为什么有 Stall：串行资源瓶颈
 
 AI_CPU 的 compute 快了，但 Free/idle 翻倍。根因不是 event 慢（event 在两种模式下都是 ~10μs），而是 **allgatherAicpuKernel 的完成时间剧烈抖动，打乱了 DBO 乒乓节奏**。
 
-#### 3.3.1 现象：纯通信 Stream 上的 Wait Time 抖动  
+#### 3.3.1 现象：纯通信 Stream 上的 Wait Time 抖动
 
 ![](../../png/ai-cpu-sync.png)
 
@@ -426,17 +426,17 @@ FC1=OFF trace:
   Stream X: ═══[MoeGatingTopK ████████████████████████ 1460μs]═══
              ↑ 一个巨大的 kernel 块，内部没有间隙
              ↑ 实际上这段时间包含了: 纯 gating 计算 + EP dispatch 通信等待
-             
+
   Stream X 上紧接着:
              ──[MoeInitRoutingCustom 391μs]──   ← 短，通信在前面已完成
 
 FC1=ON trace:
   Stream X: ═══[MoeGatingTopK ██ 213μs]═══
              ↑ 短，纯计算
-             
+
   Stream Y (或其他 stream):
              ──[AllGather ██████████ 800μs]──   ← 通信在独立 stream 上
-             
+
   Stream X 上紧接:
              ──[MoeInitRoutingCustom 916μs]──   ← AIV Vector 争抢导致变长
 ```
