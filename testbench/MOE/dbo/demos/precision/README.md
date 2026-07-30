@@ -22,6 +22,23 @@ For a quick smoke test before a full run:
 python run_precision.py --task gpqa_diamond --limit 64
 ```
 
+## Quick Regression Gate
+
+Run this after a DBO performance change before starting a longer accuracy run:
+
+```bash
+bash quick/test_dbo_precision.sh
+bash quick/test_dbo_fc1_precision.sh
+```
+
+The quick gate uses a concurrent wave of 16 unique, tokenizer-verified 2K
+prefills. It requires `should_ubatch: True` from both TP ranks, requires every
+HTTP request and output-logprob response to succeed, and fails on a generated
+token difference or sampled-token logprob difference above `1e-3`. Its result
+artifacts are saved under `precision/results/quick-*`. It reuses the normal
+compile caches for turnaround time, so it is a correctness gate rather than a
+cold-start or performance measurement.
+
 The runner forces `NO_PROXY`/`no_proxy` for local traffic and forces
 `VLLM_ASCEND_ENABLE_FLASHCOMM1=0` in both modes. It performs this sequence:
 
