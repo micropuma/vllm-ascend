@@ -21,6 +21,7 @@ import os
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
@@ -161,6 +162,22 @@ def rope_forward_oot(
     offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     query_shape, key_shape = query.shape, key.shape
+    position_padding = query.shape[0] - positions.shape[0]
+    if position_padding > 0:
+        # FlashComm's reduce-scatter pads an odd DBO microbatch before the
+        # Q/K all-gather. The model argument remains unpadded, so align it at
+        # the custom-op boundary which runs outside the compiled graph.
+        try:
+            flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
+        except (AssertionError, AttributeError, KeyError):
+            flash_comm_v1_enabled = False
+        if flash_comm_v1_enabled:
+            tp_size = get_tensor_model_parallel_world_size()
+            assert position_padding < tp_size, (
+                "FlashComm RoPE padding may add at most TP-1 tokens; "
+                f"got query={query.shape[0]}, positions={positions.shape[0]}, TP={tp_size}."
+            )
+            positions = torch.nn.functional.pad(positions, (0, position_padding))
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
     if HAS_TRITON:
