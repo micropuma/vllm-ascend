@@ -4,7 +4,7 @@ from vllm.distributed import get_dcp_group
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_logical_dp_token_counts
 from vllm_ascend.distributed.parallel_state import get_fc3_quant_x_group
 
 
@@ -33,7 +33,8 @@ def fc3_all_gather_and_maybe_unpad_impl(
             x = x[:-pad_size]
     else:
         # unpad
-        num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
+        num_tokens_across_dp_cpu = get_logical_dp_token_counts(forward_context)
+        assert num_tokens_across_dp_cpu is not None
         result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
         dp_size = get_dp_group().world_size
         x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])

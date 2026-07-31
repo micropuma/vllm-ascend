@@ -54,12 +54,22 @@ def get_mrv2_in_profile_run() -> bool:
     return _MRV2_IN_PROFILE_RUN.get()
 
 
+def get_logical_dp_token_counts(forward_context: Any) -> torch.Tensor | None:
+    """Return real DP token counts, falling back for non-DP+DBO callers."""
+    logical_counts = getattr(forward_context, "logical_num_tokens_across_dp", None)
+    if logical_counts is not None:
+        return logical_counts
+    dp_metadata = getattr(forward_context, "dp_metadata", None)
+    return None if dp_metadata is None else dp_metadata.num_tokens_across_dp_cpu
+
+
 @contextmanager
 def set_ascend_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     num_tokens: int = 0,
     num_tokens_across_dp: torch.Tensor | None = None,
+    logical_num_tokens_across_dp: torch.Tensor | None = None,
     in_profile_run: bool = False,
     num_actual_tokens: int | None = None,
     aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
@@ -94,6 +104,9 @@ def set_ascend_forward_context(
 
         forward_context.input_ids = input_ids
         forward_context.ubatch_slices_logical = ubatch_slices_logical
+        # DPMetadata carries physical collective shapes. Keep real token
+        # boundaries separately so DP padding is removed after all-gather.
+        forward_context.logical_num_tokens_across_dp = logical_num_tokens_across_dp
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -298,6 +311,15 @@ def create_ascend_forward_context(
     if dp_world_size > 1 and new_forward_context.dp_metadata is not None:
         dp_meta = new_forward_context.dp_metadata
         max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
+        logical_totals = getattr(cur_forward_context, "logical_num_tokens_across_dp", None)
+        if logical_totals is not None:
+            # DPMetadata contains physical collective sizes. Convert the
+            # equal-index physical slice back to each peer's real token count.
+            slice_start = ubatch_slices[ubatch_num].token_slice.start
+            slice_width = ubatch_slices[ubatch_num].num_tokens
+            new_forward_context.logical_num_tokens_across_dp = torch.clamp(
+                logical_totals - slice_start, min=0, max=slice_width
+            ).to(dtype=torch.int32, device="cpu")
         if new_forward_context.flash_comm_v1_enabled or new_forward_context.flashcomm_v2_enabled:
             new_forward_context.padded_length = (
                 (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size

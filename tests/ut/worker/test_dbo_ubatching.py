@@ -9,6 +9,7 @@ from vllm_ascend.worker.npu_ubatch_wrapper import (
     make_ubatch_dp_metadata,
     validate_dbo_num_ubatches,
 )
+from vllm_ascend.worker.dp_dbo_utils import resolve_dbo_dp_metadata
 from vllm_ascend.worker.ubatching import DBO_NUM_UBATCHES
 
 
@@ -44,3 +45,42 @@ def test_dbo_dp_metadata_preserves_peer_ubatch_sizes(monkeypatch):
 
     assert len(result) == 2
     assert captured == [(2050, [2050, 2200]), (2050, [2050, 2200])]
+
+
+def test_dp_dbo_skew_disables_empty_last_ubatch():
+    should_ubatch, physical, logical, mode = resolve_dbo_dp_metadata(
+        torch.tensor([4096, 2048]),
+        torch.tensor([4096, 2048]),
+        torch.tensor([1, 1]),
+        torch.tensor([0, 0]),
+    )
+
+    assert not should_ubatch
+    assert physical.tolist() == [4096, 2048]
+    assert logical.tolist() == [4096, 2048]
+    assert mode.value == 0
+
+
+def test_dp_dbo_padding_keeps_logical_peer_boundary():
+    should_ubatch, physical, logical, _ = resolve_dbo_dp_metadata(
+        torch.tensor([4096, 3072]),
+        torch.tensor([4096, 3072]),
+        torch.tensor([1, 1]),
+        torch.tensor([0, 0]),
+    )
+
+    assert should_ubatch
+    assert physical.tolist() == [4096, 4096]
+    assert logical.tolist() == [4096, 3072]
+
+
+def test_dp_dbo_requires_all_ranks_to_be_candidates():
+    should_ubatch, physical, _, _ = resolve_dbo_dp_metadata(
+        torch.tensor([4096, 4096]),
+        torch.tensor([4096, 4096]),
+        torch.tensor([1, 0]),
+        torch.tensor([0, 0]),
+    )
+
+    assert not should_ubatch
+    assert physical.tolist() == [4096, 4096]

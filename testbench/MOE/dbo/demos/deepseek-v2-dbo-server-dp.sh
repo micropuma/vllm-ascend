@@ -243,6 +243,11 @@ fi
 # Profiler args
 # ------------------------------------------------------------
 if [[ "$ENABLE_PROFILER" == "1" ]]; then
+  # Emit DBO event-boundary labels only for diagnostic traces. The imported
+  # helper is a nullcontext in regular serving, but keeping this opt-in avoids
+  # unnecessary CPU profiler ranges in plain benchmark processes.
+  export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
+
   # stop_profile flush 可能较慢，避免 RPC 超时
   export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-1800000}
 

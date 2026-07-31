@@ -36,7 +36,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_logical_dp_token_counts
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -393,7 +393,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 use_ep_comm = forward_context.dp_metadata is not None
                 if flash_comm_enabled:
                     if use_ep_comm:
-                        unpadded_length = int(forward_context.dp_metadata.num_tokens_across_dp_cpu.sum().item())
+                        logical_counts = get_logical_dp_token_counts(forward_context)
+                        assert logical_counts is not None
+                        unpadded_length = int(logical_counts.sum().item())
                         padded_length = forward_context.padded_length
                     else:
                         unpadded_length = forward_context.num_tokens

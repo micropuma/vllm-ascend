@@ -33,6 +33,12 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8000}
 LABEL=${LABEL:-baseline}
 
+# vLLM bench uses aiohttp with trust_env=True. Keep local serving traffic out
+# of any shell-configured HTTP proxy, otherwise the proxy returns 502 before a
+# request reaches the API server.
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export no_proxy="$NO_PROXY"
+
 # Default benchmark preset: prefill-heavy, close to the useful DBO test regime.
 BENCH_PRESET=${BENCH_PRESET:-prefill4k}
 
