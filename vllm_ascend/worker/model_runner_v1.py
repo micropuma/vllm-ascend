@@ -160,6 +160,7 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.npu_ubatch_wrapper import AscendUBatchWrapper
 from vllm_ascend.worker.pcp_utils import PCPManager
 from vllm_ascend.worker.ubatch_utils import check_enable_ubatch
+from vllm_ascend.worker.dp_dbo_utils import resolve_dbo_dp_metadata
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -654,7 +655,10 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor = torch.zeros(2, self.dp_size, device=device_str, dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
-        dist.all_reduce(packed_tensor, group=group)
+        with record_function_or_nullcontext(
+            f"dp.sync_metadata.{device_str}_allreduce"
+        ):
+            dist.all_reduce(packed_tensor, group=group)
         if device_str == "npu":
             packed_tensor = packed_tensor.cpu()
 
@@ -672,6 +676,58 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_after_padding = num_tokens_across_dp.cpu()
 
         return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
+
+    def _coordinate_dbo_batch_across_dp(
+        self,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        should_attempt_ubatch: bool,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> tuple[bool, torch.Tensor, torch.Tensor, CUDAGraphMode]:
+        """Coordinate the DP+DBO batch with one control-plane allreduce.
+
+        The physical totals returned here describe collective tensor shapes.
+        The logical totals preserve the real per-DP-rank token boundaries for
+        all-gather recovery and output unpadding.
+        """
+        assert self.dp_size > 1
+
+        # MC2 case does not need to coordinate across DP ranks, and is not compatible with DBO. 
+        # Skip the allreduce and return the local values.
+        if should_skip_allreduce_across_dp_group(self.vllm_config, False):
+            tokens = torch.tensor(
+                [num_tokens_padded] * self.dp_size, device="cpu", dtype=torch.int32
+            )
+            logical_tokens = torch.tensor(
+                [num_tokens_unpadded] * self.dp_size, device="cpu", dtype=torch.int32
+            )
+            return should_attempt_ubatch, tokens, logical_tokens, cudagraph_mode
+
+        device_str, group = (
+            ("npu", get_dp_group().device_group)
+            if self.ascend_config.dp_allreduce_on_npu
+            else ("cpu", get_dp_group().cpu_group)
+        )
+        # each rank owns a distince column, so this sum all reduce equals to all gather
+        packed_tensor = torch.zeros(4, self.dp_size, device=device_str, dtype=torch.int32)
+        packed_tensor[0, self.dp_rank] = num_tokens_unpadded
+        packed_tensor[1, self.dp_rank] = num_tokens_padded
+        packed_tensor[2, self.dp_rank] = int(should_attempt_ubatch)
+        packed_tensor[3, self.dp_rank] = cudagraph_mode.value
+        with record_function_or_nullcontext(
+            f"dp.coordinate_dbo.{device_str}_allreduce"
+        ):
+            dist.all_reduce(packed_tensor, group=group)
+        if device_str == "npu":
+            packed_tensor = packed_tensor.cpu()
+
+        return resolve_dbo_dp_metadata(
+            logical_tokens=packed_tensor[0, :],
+            physical_tokens=packed_tensor[1, :],
+            dbo_candidates=packed_tensor[2, :],
+            cudagraph_modes=packed_tensor[3, :],
+            num_ubatches=getattr(self.parallel_config, "num_ubatches", 2),
+        )
 
     def get_model(self) -> nn.Module:
         # get raw model out of the aclgraph / ubatch wrapper.
@@ -2050,6 +2106,7 @@ class NPUModelRunner(GPUModelRunner):
                     batch_desc,
                     should_ubatch,
                     num_tokens_across_dp,
+                    logical_num_tokens_across_dp,
                     cudagraph_stats,
                 ) = self._determine_batch_execution_and_padding(
                     num_tokens=num_tokens_unpadded,
@@ -2225,6 +2282,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
+                logical_num_tokens_across_dp=logical_num_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
@@ -2829,7 +2887,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
-    ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
+    ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
         uniform_decode = (
@@ -2876,7 +2934,41 @@ class NPUModelRunner(GPUModelRunner):
         from vllm_ascend.ascend_forward_context import select_moe_comm_method
 
         num_tokens_across_dp = None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        logical_num_tokens_across_dp = None
+        should_ubatch = check_enable_ubatch(
+            num_tokens,
+            num_tokens_padded,
+            uniform_decode=False,
+            vllm_config=self.vllm_config,
+            moe_comm_type=select_moe_comm_method(num_tokens_padded, self.vllm_config),
+        )
+        if (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.parallel_config.enable_dbo
+        ):
+            # All DP ranks must make the same DBO and padding decision from
+            # the same token counts. Otherwise, uneven batches can give one
+            # rank an extra ubatch, causing the ranks to issue EP collectives
+            # in a different order.
+            (
+                should_ubatch,
+                num_tokens_across_dp,
+                logical_num_tokens_across_dp,
+                synced_cudagraph_mode,
+            ) = self._coordinate_dbo_batch_across_dp(
+                num_tokens_unpadded=num_tokens,
+                num_tokens_padded=num_tokens_padded,
+                should_attempt_ubatch=should_ubatch,
+                cudagraph_mode=cudagraph_mode,
+            )
+            dp_rank = self.parallel_config.data_parallel_rank
+            num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded,
+                valid_modes={synced_cudagraph_mode},
+            )
+            assert batch_descriptor.num_tokens == num_tokens_padded
+        elif self.vllm_config.parallel_config.data_parallel_size > 1:
             _, num_tokens_across_dp, synced_cudagraph_mode = self._sync_metadata_across_dp(
                 num_tokens=num_tokens_padded,
                 cudagraph_mode=cudagraph_mode,
@@ -2895,32 +2987,6 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
-
-        should_ubatch = check_enable_ubatch(
-            num_tokens,
-            num_tokens_padded,
-            uniform_decode=False,
-            vllm_config=self.vllm_config,
-            moe_comm_type=select_moe_comm_method(num_tokens_padded, self.vllm_config),
-        )
-
-        # dp情况下开启dbo，要求每个rank都同时should ubatch，才开启dbo
-        if (
-            self.parallel_config.data_parallel_size > 1
-            and self.parallel_config.enable_dbo
-            and not should_skip_allreduce_across_dp_group(self.vllm_config, False)
-        ):
-            # 默认用gloo做cpu side all reduce，回退用npu side all reduce
-            device, group = (
-                ("npu", get_dp_group().device_group)
-                if self.ascend_config.dp_allreduce_on_npu
-                else ("cpu", get_dp_group().cpu_group)
-            )
-            ubatch_flag = torch.tensor(
-                [int(should_ubatch)], device=device, dtype=torch.int32
-            )
-            dist.all_reduce(ubatch_flag, op=dist.ReduceOp.MIN, group=group)
-            should_ubatch = bool(ubatch_flag.item())
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(
@@ -2935,6 +3001,7 @@ class NPUModelRunner(GPUModelRunner):
             batch_descriptor,
             should_ubatch,
             num_tokens_across_dp,
+            logical_num_tokens_across_dp,
             cudagraph_stats,
         )
 
@@ -3368,7 +3435,14 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
-        _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
+        (
+            _cudagraph_mode,
+            batch_desc,
+            should_ubatch,
+            num_tokens_across_dp,
+            logical_num_tokens_across_dp,
+            _,
+        ) = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens,
@@ -3546,6 +3620,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.vllm_config,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
+                logical_num_tokens_across_dp=logical_num_tokens_across_dp,
                 in_profile_run=is_profile,
                 num_actual_tokens=num_tokens_padded,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
