@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast, deterministic DBO serving correctness gate for DeepSeek-V2 TP=2.
+"""Fast, deterministic DBO serving correctness gate for DeepSeek-V2.
 
 This is deliberately a regression gate, not an accuracy benchmark. It sends a
 single concurrent long-prefill wave, requires DBO evidence from both TP ranks,
@@ -33,12 +33,22 @@ DEFAULT_INPUT_LEN = 2048
 DEFAULT_OUTPUT_LEN = 16
 DEFAULT_TIMEOUT = 300.0
 DEFAULT_LOGPROB_ATOL = 1e-3
+DEFAULT_TP_SIZE = 2
+DEFAULT_DP_SIZE = 1
 READY_TIMEOUT = 1800.0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--flashcomm1", choices=(0, 1), type=int, required=True)
+    parser.add_argument("--tp-size", type=int, default=DEFAULT_TP_SIZE)
+    parser.add_argument("--dp-size", type=int, default=DEFAULT_DP_SIZE)
+    parser.add_argument("--dp-local", type=int)
+    parser.add_argument(
+        "--server-script",
+        type=Path,
+        help="Use this launcher for both baseline and DBO; it must honor DBO_ENABLED.",
+    )
     parser.add_argument("--model", default=os.getenv("MODEL", DEFAULT_MODEL))
     parser.add_argument("--host", default=os.getenv("HOST", DEFAULT_HOST))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", DEFAULT_PORT)))
@@ -50,6 +60,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logprob-atol", type=float, default=DEFAULT_LOGPROB_ATOL)
     parser.add_argument("--out-dir", type=Path)
     args = parser.parse_args()
+    if args.tp_size < 1 or args.dp_size < 1:
+        parser.error("--tp-size and --dp-size must be positive")
+    if args.dp_local is None:
+        args.dp_local = args.dp_size
+    if args.dp_local < 1 or args.dp_local > args.dp_size:
+        parser.error("--dp-local must be in [1, dp-size]")
+    if args.dp_size > 1:
+        if args.tp_size != 1:
+            parser.error("the DP gate currently supports TP=1 only")
+        if args.flashcomm1:
+            parser.error("FlashComm1 is unsupported for the TP=1 DP gate")
+        if args.server_script is None:
+            parser.error("--server-script is required for DP so baseline honors DBO_ENABLED=0")
     if args.input_len < 1024:
         parser.error("--input-len must be >= 1024 so it is DBO-prefill eligible")
     if args.num_prompts < 2 or args.concurrency < 2:
@@ -102,24 +125,36 @@ def build_prompts(model: str, count: int, target_tokens: int, seed: int) -> tupl
     return prompts, lengths
 
 
-def server_environment(mode: str, flashcomm1: int) -> dict[str, str]:
+def server_environment(mode: str, args: argparse.Namespace) -> dict[str, str]:
     environment = os.environ.copy()
     environment.update({
         "VLLM_ASCEND_ENABLE_DBO": "1" if mode == "dbo" else "0",
-        "VLLM_ASCEND_ENABLE_FLASHCOMM1": str(flashcomm1),
+        "VLLM_ASCEND_ENABLE_FLASHCOMM1": str(args.flashcomm1),
         "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": "0",
         "VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED": "0",
         "VLLM_LOGGING_LEVEL": "DEBUG" if mode == "dbo" else "INFO",
         "NO_PROXY": "127.0.0.1,localhost",
         "no_proxy": "127.0.0.1,localhost",
     })
+    environment.update({
+        "DBO_ENABLED": "1" if mode == "dbo" else "0",
+        "TP": str(args.tp_size),
+        "DP": str(args.dp_size),
+        "DP_LOCAL": str(args.dp_local),
+    })
     return environment
 
 
 def start_server(mode: str, demos_dir: Path, out_dir: Path, args: argparse.Namespace) -> tuple[subprocess.Popen[bytes], Path]:
-    script = "deepseek-v2-dbo-server.sh" if mode == "dbo" else "deepseek-v2-server.sh"
+    script = args.server_script or Path(
+        "deepseek-v2-dbo-server.sh" if mode == "dbo" else "deepseek-v2-server.sh"
+    )
+    if not script.is_absolute():
+        script = demos_dir / script
+    if not script.is_file():
+        raise RuntimeError(f"server script does not exist: {script}")
     log_path = out_dir / f"{mode}_server.log"
-    environment = server_environment(mode, args.flashcomm1)
+    environment = server_environment(mode, args)
     if mode == "dbo":
         # Isolate the DBO instance's cache without deleting shared caches.
         dbo_xdg_cache = out_dir / "dbo-xdg-cache"
@@ -128,7 +163,7 @@ def start_server(mode: str, demos_dir: Path, out_dir: Path, args: argparse.Names
     environment.update({"MODEL": args.model, "HOST": args.host, "PORT": str(args.port)})
     log_file = log_path.open("wb")
     process = subprocess.Popen(
-        ["bash", str(demos_dir / script)], cwd=demos_dir, env=environment,
+        ["bash", str(script)], cwd=demos_dir, env=environment,
         stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True,
     )
     log_file.close()
@@ -195,12 +230,39 @@ async def request_wave(endpoint: str, args: argparse.Namespace, prompts: list[st
         return await asyncio.gather(*(request_one(index, prompt) for index, prompt in enumerate(prompts)))
 
 
-def require_dbo_trigger(log_path: Path, tp_size: int = 2) -> dict[str, Any]:
-    triggered = set(re.findall(r"Worker_TP(\d+).*should_ubatch: True", log_path.read_text(errors="replace")))
-    expected = {str(rank) for rank in range(tp_size)}
-    report = {"triggered_tp_ranks": sorted(triggered), "missing_tp_ranks": sorted(expected - triggered)}
-    if report["missing_tp_ranks"]:
-        raise RuntimeError(f"DBO did not trigger on TP ranks {report['missing_tp_ranks']}")
+def require_dbo_trigger(log_path: Path, tp_size: int = DEFAULT_TP_SIZE,
+                        dp_size: int = DEFAULT_DP_SIZE) -> dict[str, Any]:
+    """Require an eligible DBO batch from every logical worker.
+
+    vLLM's process prefix is ``Worker_TP<tp>`` for TP-only. The observed
+    TP=1 DP executor uses ``Worker_DP<dp>_EP<ep>`` (no explicit TP field),
+    while other executors may use ``Worker_DP<dp>_TP<tp>``. Keep the logical
+    worker IDs in the artifact so a naming change cannot weaken this gate.
+    """
+    text = log_path.read_text(errors="replace")
+    triggered: set[tuple[int, int]] = set()
+    prefix = re.compile(
+        r"Worker_(?:(?:DP(?P<dp>\d+)(?:_TP(?P<dp_tp>\d+))?)|TP(?P<tp>\d+))"
+    )
+    for line in text.splitlines():
+        if "should_ubatch: True" not in line:
+            continue
+        match = prefix.search(line)
+        if match is None:
+            continue
+        dp_rank = int(match.group("dp") or 0)
+        tp_rank = int(match.group("dp_tp") or match.group("tp") or 0)
+        triggered.add((dp_rank, tp_rank))
+    expected = {(dp_rank, tp_rank) for dp_rank in range(dp_size) for tp_rank in range(tp_size)}
+    report = {
+        "triggered_workers": [f"dp{dp}_tp{tp}" for dp, tp in sorted(triggered)],
+        "missing_workers": [f"dp{dp}_tp{tp}" for dp, tp in sorted(expected - triggered)],
+    }
+    if report["missing_workers"]:
+        raise RuntimeError(
+            f"DBO did not trigger on workers {report['missing_workers']}; "
+            f"observed {report['triggered_workers']}"
+        )
     return report
 
 
@@ -238,7 +300,7 @@ def run_mode(mode: str, demos_dir: Path, out_dir: Path, args: argparse.Namespace
         wait_for_server(f"http://{args.host}:{args.port}", process)
         results = asyncio.run(request_wave(f"http://{args.host}:{args.port}", args, prompts))
         if mode == "dbo":
-            require_dbo_trigger(log_path)
+            require_dbo_trigger(log_path, args.tp_size, args.dp_size)
         return results, log_path
     finally:
         stop_server(process)
@@ -257,7 +319,7 @@ def main() -> int:
     baseline, _ = run_mode("baseline", demos_dir, out_dir, args, prompts)
     dbo, dbo_log = run_mode("dbo", demos_dir, out_dir, args, prompts)
     comparison = compare_runs(baseline, dbo, args.logprob_atol)
-    comparison["dbo_trigger"] = require_dbo_trigger(dbo_log)
+    comparison["dbo_trigger"] = require_dbo_trigger(dbo_log, args.tp_size, args.dp_size)
     (out_dir / "baseline.json").write_text(json.dumps(baseline, ensure_ascii=False, indent=2) + "\n")
     (out_dir / "dbo.json").write_text(json.dumps(dbo, ensure_ascii=False, indent=2) + "\n")
     (out_dir / "comparison.json").write_text(json.dumps(comparison, ensure_ascii=False, indent=2) + "\n")

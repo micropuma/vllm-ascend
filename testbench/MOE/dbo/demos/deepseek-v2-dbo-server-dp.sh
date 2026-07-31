@@ -64,13 +64,24 @@ mkdir -p \
 # TODO(leon)：目前这个配置和flashcomm2 产生不兼容bug
 export HCCL_OP_EXPANSION_MODE=${HCCL_OP_EXPANSION_MODE:-AI_CPU}
 
-# DP-only 基线：TP=1 时 FlashComm1 不受支持；保持关闭以验证 DP+EP+DBO+compile
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=${VLLM_ASCEND_ENABLE_FLASHCOMM1:-0}
-export VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE=${VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE:-0}
-export VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED=${VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED:-0}
+# DP-only: FlashComm is unsupported with TP=1. Keep it disabled for both the
+# baseline and DBO configurations so DBO_ENABLED is the only A/B variable.
+if [[ "${VLLM_ASCEND_ENABLE_FLASHCOMM1:-0}" != "0" \
+    || "${VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE:-0}" != "0" \
+    || "${VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED:-0}" != "0" ]]; then
+  echo "FlashComm is unsupported for this TP=1, DP=2 validation script." >&2
+  exit 2
+fi
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+export VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE=0
+export VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED=0
 
-# 显式打开 Ascend DBO 环境变量
-export VLLM_ASCEND_ENABLE_DBO=${VLLM_ASCEND_ENABLE_DBO:-1}
+DBO_ENABLED=${DBO_ENABLED:-1}
+if [[ "$DBO_ENABLED" != "0" && "$DBO_ENABLED" != "1" ]]; then
+  echo "DBO_ENABLED must be 0 or 1, got $DBO_ENABLED" >&2
+  exit 2
+fi
+export VLLM_ASCEND_ENABLE_DBO="$DBO_ENABLED"
 
 # 调试 DBO 触发时可设 DEBUG；正式性能测试建议 INFO
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
@@ -90,7 +101,6 @@ DP_LOCAL=${DP_LOCAL:-2}
 # 为 4K prompt 预留 chat template / special token 空间
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 
-# DBO 需要足够大的 batch token 才有意义
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 
@@ -111,10 +121,29 @@ DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-1000000000}
 # ------------------------------------------------------------
 ENABLE_PROFILER=${ENABLE_PROFILER:-0}
 PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
-TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/dbo_profile}
+TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/${LABEL:-dp_dbo}_profile}
 
 # profiler 时建议小一点，避免 trace 爆炸
 PROFILER_MAX_ITERATIONS=${PROFILER_MAX_ITERATIONS:-20}
+
+# Capture kernel/communication and Python stacks separately. Collecting both
+# in a long DP trace produces oversized artifacts and can leave one rank
+# without a parseable CANN output.
+PROFILER_MODE=${PROFILER_MODE:-operator} # operator | host_stack
+case "$PROFILER_MODE" in
+    operator)
+        PROFILER_WITH_STACK=false
+        PROFILER_RECORD_SHAPES=true
+        ;;
+    host_stack)
+        PROFILER_WITH_STACK=true
+        PROFILER_RECORD_SHAPES=false
+        ;;
+    *)
+        echo "Unknown PROFILER_MODE=$PROFILER_MODE (expected operator or host_stack)" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "$TORCH_PROFILER_DIR"
 
@@ -143,7 +172,7 @@ echo "  MAX_MODEL_LEN                       = $MAX_MODEL_LEN"
 echo "  MAX_NUM_BATCHED_TOKENS              = $MAX_NUM_BATCHED_TOKENS"
 echo "  MAX_NUM_SEQS                        = $MAX_NUM_SEQS"
 echo ""
-echo "  --enable-dbo                        = ON"
+echo "  --enable-dbo                        = $([[ "$DBO_ENABLED" == "1" ]] && echo ON || echo OFF)"
 echo "  DBO_PREFILL_TOKEN_THRESHOLD          = $DBO_PREFILL_TOKEN_THRESHOLD"
 echo "  DBO_DECODE_TOKEN_THRESHOLD           = $DBO_DECODE_TOKEN_THRESHOLD"
 echo ""
@@ -155,6 +184,7 @@ echo "  VLLM_ASCEND_ENABLE_DBO               = $VLLM_ASCEND_ENABLE_DBO"
 echo "  VLLM_LOGGING_LEVEL                   = $VLLM_LOGGING_LEVEL"
 echo ""
 echo "  ENABLE_PROFILER                      = $ENABLE_PROFILER"
+echo "  PROFILER_MODE                        = $PROFILER_MODE"
 echo "  TORCH_PROFILER_DIR                   = $TORCH_PROFILER_DIR"
 echo "  PROFILER_MAX_ITERATIONS              = $PROFILER_MAX_ITERATIONS"
 echo "  LOG_STATS                            = $LOG_STATS"
@@ -177,6 +207,7 @@ serve_args=(
   --port "$PORT"
 
   --dtype bfloat16
+  --generation-config vllm
 
   --distributed-executor-backend mp
   --tensor-parallel-size "$TP"
@@ -184,15 +215,20 @@ serve_args=(
   --data-parallel-size-local "$DP_LOCAL"
   --enable-expert-parallel
 
-  --enable-dbo
   --all2all-backend deepep_low_latency
-  --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
-  --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
 
   --max-model-len "$MAX_MODEL_LEN"
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --max-num-seqs "$MAX_NUM_SEQS"
 )
+
+if [[ "$DBO_ENABLED" == "1" ]]; then
+  serve_args+=(
+    --enable-dbo
+    --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
+    --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
+  )
+fi
 
 if [[ "$ENFORCE_EAGER" == "1" ]]; then
   serve_args+=(--enforce-eager)
@@ -210,12 +246,9 @@ if [[ "$ENABLE_PROFILER" == "1" ]]; then
   # stop_profile flush 可能较慢，避免 RPC 超时
   export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-1800000}
 
-  # 简洁版 profiler config：
-  #   - torch_profiler_with_stack=true：采 Python call stack
-  #   - torch_profiler_record_shapes=true：采 shape
-  #   - torch_profiler_use_gzip=false：不压缩，方便 grep / 检查
-  #   - max_iterations：限制采集轮数，防止 trace 过大
-  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
+  # max_iterations applies to workers only. Disable the unbounded AsyncLLM
+  # frontend trace so the profile window and output size remain controlled.
+  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
 
   echo "  PROFILER_CONFIG                     = ${PROFILER_CONFIG}"
 

@@ -113,6 +113,25 @@ TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/${LABEL:-dbo}_profile}
 # profiler 时建议小一点，避免 trace 爆炸
 PROFILER_MAX_ITERATIONS=${PROFILER_MAX_ITERATIONS:-20}
 
+# Keep kernel/communication analysis and Python stack analysis separate.  Stack
+# collection on both TP ranks makes the operator trace unnecessarily large and
+# has produced incomplete Ascend trace JSONs in long DBO runs.
+PROFILER_MODE=${PROFILER_MODE:-operator} # operator | host_stack
+case "$PROFILER_MODE" in
+    operator)
+        PROFILER_WITH_STACK=false
+        PROFILER_RECORD_SHAPES=true
+        ;;
+    host_stack)
+        PROFILER_WITH_STACK=true
+        PROFILER_RECORD_SHAPES=false
+        ;;
+    *)
+        echo "Unknown PROFILER_MODE=$PROFILER_MODE (expected operator or host_stack)" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p "$TORCH_PROFILER_DIR"
 
 
@@ -149,6 +168,7 @@ echo "  VLLM_ASCEND_ENABLE_DBO               = $VLLM_ASCEND_ENABLE_DBO"
 echo "  VLLM_LOGGING_LEVEL                   = $VLLM_LOGGING_LEVEL"
 echo ""
 echo "  ENABLE_PROFILER                      = $ENABLE_PROFILER"
+echo "  PROFILER_MODE                        = $PROFILER_MODE"
 echo "  TORCH_PROFILER_DIR                   = $TORCH_PROFILER_DIR"
 echo "  PROFILER_MAX_ITERATIONS              = $PROFILER_MAX_ITERATIONS"
 echo "  LOG_STATS                            = $LOG_STATS"
@@ -198,12 +218,9 @@ if [[ "$ENABLE_PROFILER" == "1" ]]; then
   # stop_profile flush 可能较慢，避免 RPC 超时
   export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-1800000}
 
-  # 简洁版 profiler config：
-  #   - torch_profiler_with_stack=true：采 Python call stack
-  #   - torch_profiler_record_shapes=true：采 shape
-  #   - torch_profiler_use_gzip=false：不压缩，方便 grep / 检查
-  #   - max_iterations：限制采集轮数，防止 trace 过大
-  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
+  # max_iterations applies to workers only. Disable the unbounded AsyncLLM
+  # frontend trace so the profile window and output size remain controlled.
+  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
 
   echo "  PROFILER_CONFIG                     = ${PROFILER_CONFIG}"
 

@@ -89,6 +89,7 @@ SAVE_DETAILED=${SAVE_DETAILED:-0}
 
 OUT_DIR=${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/results}
 PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
+TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/${LABEL}_profile}
 mkdir -p "$OUT_DIR"
 
 # Optional suffix for repeated runs, e.g. RESULT_SUFFIX=_run1.
@@ -197,23 +198,37 @@ run_bench() {
         curl -sf -X POST "http://${HOST}:${port}/stop_profile" >/dev/null
         trap - EXIT
 
-        local profiler_dir="${PROFILE_ROOT}/${label}_profile"
-        local latest
-        latest=$(find "$profiler_dir" -maxdepth 1 -mindepth 1 -type d -name '*_ascend_pt' \
-                 2>/dev/null | sort | tail -n 1 || true)
-        if [[ -n "$latest" ]]; then
-            echo "  ✓ Profile directory: $latest"
+        # The launcher accepts TORCH_PROFILER_DIR, which may intentionally not
+        # follow the historical ${label}_profile convention.
+        local profiler_dir="$TORCH_PROFILER_DIR"
+        local profile_runs=()
+        mapfile -t profile_runs < <(find "$profiler_dir" -maxdepth 1 -mindepth 1 \
+            -type d -name '*_ascend_pt' 2>/dev/null | sort)
+        if (( ${#profile_runs[@]} > 0 )); then
             if python3 -c 'import torch_npu' 2>/dev/null; then
-                echo "  Running torch_npu analyse..."
-                PROFILE_RUN_DIR="$latest" python3 - <<'PYEOF'
+                local profile_run
+                for profile_run in "${profile_runs[@]}"; do
+                    echo "  Running torch_npu analyse: $profile_run"
+                    PROFILE_RUN_DIR="$profile_run" python3 - <<'PYEOF'
 import os
 from torch_npu.profiler.profiler import analyse
 analyse(os.environ["PROFILE_RUN_DIR"])
 print("analyse done. Open with TensorBoard / MindStudio:", os.environ["PROFILE_RUN_DIR"])
 PYEOF
+                    local output_dir="$profile_run/ASCEND_PROFILER_OUTPUT"
+                    if [[ ! -s "$output_dir/step_trace_time.csv" ]]; then
+                        echo "  ✗ Missing step_trace_time.csv: $output_dir" >&2
+                        return 1
+                    fi
+                    if ! jq empty "$output_dir/trace_view.json" >/dev/null 2>&1; then
+                        echo "  ✗ Invalid trace_view.json: $output_dir" >&2
+                        return 1
+                    fi
+                    echo "  ✓ Valid CANN aggregate and trace: $profile_run"
+                done
             else
                 echo "  torch_npu is unavailable. Skip analyse."
-                echo "  tensorboard --logdir $latest"
+                echo "  tensorboard --logdir $profiler_dir"
             fi
         else
             echo "  ⚠ Profile directory not found. Confirm server was started with ENABLE_PROFILER=1."

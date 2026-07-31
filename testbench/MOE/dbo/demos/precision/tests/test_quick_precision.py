@@ -31,11 +31,21 @@ def test_require_dbo_trigger_requires_every_rank(tmp_path: Path) -> None:
     log = tmp_path / "server.log"
     log.write_text("Worker_TP0 should_ubatch: True\nWorker_TP1 should_ubatch: True\n")
     assert quick_precision.require_dbo_trigger(log) == {
-        "triggered_tp_ranks": ["0", "1"], "missing_tp_ranks": []}
+        "triggered_workers": ["dp0_tp0", "dp0_tp1"], "missing_workers": []}
     log.write_text("Worker_TP0 should_ubatch: True\n")
     try:
         quick_precision.require_dbo_trigger(log)
     except RuntimeError as error:
-        assert "['1']" in str(error)
+        assert "dp0_tp1" in str(error)
     else:
         raise AssertionError("missing TP rank must fail the quick gate")
+
+
+def test_require_dbo_trigger_requires_every_dp_worker(tmp_path: Path) -> None:
+    log = tmp_path / "server.log"
+    log.write_text(
+        "Worker_DP0_EP0 should_ubatch: True\n"
+        "Worker_DP1_EP1 should_ubatch: True\n"
+    )
+    assert quick_precision.require_dbo_trigger(log, tp_size=1, dp_size=2) == {
+        "triggered_workers": ["dp0_tp0", "dp1_tp0"], "missing_workers": []}
