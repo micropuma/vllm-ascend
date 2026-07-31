@@ -29,6 +29,56 @@ def validate_dbo_num_ubatches(num_ubatches: int) -> None:
         )
 
 
+def make_ubatch_dp_metadata(
+    vllm_config: VllmConfig,
+    ubatch_slices,
+    dp_metadata: DPMetadata | None,
+) -> list[DPMetadata | None]:
+    """Build per-ubatch DP metadata without discarding peer batch sizes.
+
+    The parent forward context has already coordinated the total token count
+    for every DP rank. DBO slices each rank's padded batch at identical index
+    positions, so split every peer total with the same rule used by
+    ``maybe_create_ubatch_slices``. Repeating the local slice size for every
+    DP rank corrupts the MoE all-to-all metadata when ranks receive unequal
+    prefill batches.
+    """
+    if dp_metadata is None:
+        return [None] * len(ubatch_slices)
+
+    num_ubatches = len(ubatch_slices)
+    peer_totals = dp_metadata.num_tokens_across_dp_cpu.tolist()
+    peer_slices = [
+        [total // num_ubatches] * (num_ubatches - 1)
+        + [total - (total // num_ubatches) * (num_ubatches - 1)]
+        for total in peer_totals
+    ]
+    dp_rank = vllm_config.parallel_config.data_parallel_rank
+    local_slice_sizes = [ubatch_slice.num_tokens for ubatch_slice in ubatch_slices]
+    expected_local_slice_sizes = peer_slices[dp_rank]
+
+    # check if the local slice sizes match the expected slice sizes for this DP rank
+    if local_slice_sizes != expected_local_slice_sizes:
+        raise RuntimeError(
+            "DBO DP metadata requires equal-index token slicing across ranks; "
+            f"expected {expected_local_slice_sizes} for DP rank {dp_rank}, "
+            f"got {local_slice_sizes}."
+        )
+
+    return [
+        DPMetadata.make(
+            vllm_config.parallel_config,
+            ubatch_slice.num_tokens,
+            torch.tensor(
+                [peer_slices[peer_rank][ubatch_index] for peer_rank in range(len(peer_totals))],
+                device="cpu",
+                dtype=torch.int32,
+            ),
+        )
+        for ubatch_index, ubatch_slice in enumerate(ubatch_slices)
+    ]
+
+
 @dataclass
 class AscendUbatchMetadata(UbatchMetadata):
     pass
@@ -405,23 +455,9 @@ class AscendUBatchWrapper(UBatchWrapper):
         inputs_embeds = kwargs["inputs_embeds"]
         compute_stream = torch.npu.current_stream()
 
-        ubatch_dp_metadata = []
-        dp_size = self.vllm_config.parallel_config.data_parallel_size
-
-        for ubatch_slice in ubatch_slices:
-            if dp_size > 1:
-                ubatch_num_tokens_across_dp = torch.tensor(
-                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-                )
-                ubatch_dp_metadata.append(
-                    DPMetadata.make(
-                        self.vllm_config.parallel_config,
-                        ubatch_slice.num_tokens,
-                        ubatch_num_tokens_across_dp,
-                    )
-                )
-            else:
-                ubatch_dp_metadata.append(None)
+        ubatch_dp_metadata = make_ubatch_dp_metadata(
+            self.vllm_config, ubatch_slices, forward_context.dp_metadata
+        )
 
         if num_tokens not in self.cudagraphs and cudagraph_runtime_mode is CUDAGraphMode.FULL:
             ubatch_metadata = self._make_ubatch_metadata(
