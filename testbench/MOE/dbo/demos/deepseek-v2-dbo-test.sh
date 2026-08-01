@@ -93,6 +93,12 @@ WARMUP_CONCURRENCY=${WARMUP_CONCURRENCY:-16}
 # Optional detailed request records. Useful when locating TTFT / ITL tails.
 SAVE_DETAILED=${SAVE_DETAILED:-0}
 
+# torch_npu stops asynchronously in each TP worker. CANN analysis removes the
+# raw PROF_* data after processing, so wait for its completion marker instead
+# of racing analyse() immediately after the HTTP stop response.
+PROFILER_FLUSH_TIMEOUT_SECONDS=${PROFILER_FLUSH_TIMEOUT_SECONDS:-180}
+PROFILER_FLUSH_POLL_SECONDS=${PROFILER_FLUSH_POLL_SECONDS:-2}
+
 OUT_DIR=${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/results}
 PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-ascend/profile}
 TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/${LABEL}_profile}
@@ -214,6 +220,16 @@ run_bench() {
             if python3 -c 'import torch_npu' 2>/dev/null; then
                 local profile_run
                 for profile_run in "${profile_runs[@]}"; do
+                    local elapsed_seconds=0
+                    while ! find "$profile_run" -path '*/host/start_info.done' \
+                        -type f -print -quit | grep -q .; do
+                        if (( elapsed_seconds >= PROFILER_FLUSH_TIMEOUT_SECONDS )); then
+                            echo "  ✗ Timed out waiting for CANN flush marker: $profile_run" >&2
+                            return 1
+                        fi
+                        sleep "$PROFILER_FLUSH_POLL_SECONDS"
+                        elapsed_seconds=$((elapsed_seconds + PROFILER_FLUSH_POLL_SECONDS))
+                    done
                     echo "  Running torch_npu analyse: $profile_run"
                     PROFILE_RUN_DIR="$profile_run" python3 - <<'PYEOF'
 import os

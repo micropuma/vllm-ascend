@@ -9,12 +9,20 @@ set -euo pipefail
 #  deepseek-v2-dbo-test.sh），确保结果与手动跑完全对齐。
 #
 # 用法：
-#   bash auto_benchmark.sh                        # 跑全部 10 组配置
-#   CONFIGS="baseline dbo fc2 dbo_fc2" bash ...   # 只跑指定配置
-#   BENCH_PRESETS="prefill4k,prefill8k" bash ...  # 多 workload
-#   DRY_RUN=1 bash auto_benchmark.sh              # 只打印，不执行
+#   bash auto_benchmark.sh                              # 默认跑 DeepSeek TP P0
+#   TEST_GROUPS=all bash auto_benchmark.sh              # 跑全部具名测试组
+#   TEST_GROUPS="p0_deepseek_tp,p2_deepseek_decode" bash ...
+#   CONFIGS="baseline dbo_fc1" bash ...                 # 在每个选中组中跑指定配置
+#   BENCH_PRESETS="prefill4k,prefill4k16" bash ...     # 覆盖 workload
+#   DEBUG_VALIDATION=0 bash auto_benchmark.sh            # 只跑性能轮
+#   DRY_RUN=1 bash auto_benchmark.sh                     # 只打印，不执行
 #
-# Config 矩阵 (10 组):
+# Test groups:
+#   p0_deepseek_tp, p0_deepseek_dp, p0_deepseek_dp_shared_expert
+#   p1_deepseek_small_batch, p1_qwen_tp, p2_deepseek_decode
+#   all
+#
+# DeepSeek TP config matrix:
 #   baseline        DBO=0  FC1=0  FC2=0  HCCL=AI_CPU
 #   baseline_aiv    DBO=0  FC1=0  FC2=0  HCCL=AIV
 #   fc1             DBO=0  FC1=1  FC2=0  HCCL=AI_CPU
@@ -32,7 +40,13 @@ set -euo pipefail
 DEMOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_BASELINE="${DEMOS_DIR}/deepseek-v2-server.sh"
 SERVER_DBO="${DEMOS_DIR}/deepseek-v2-dbo-server.sh"
+SERVER_DP="${DEMOS_DIR}/deepseek-v2-dbo-server-dp.sh"
 TEST_SCRIPT="${DEMOS_DIR}/deepseek-v2-dbo-test.sh"
+QWEN_DIR="${DEMOS_DIR}/Qwen3-30B"
+QWEN_SERVER_BASELINE="${QWEN_DIR}/Qwen3-30B-server.sh"
+QWEN_SERVER_DBO="${QWEN_DIR}/Qwen3-30B-dbo-server.sh"
+QWEN_TEST_SCRIPT="${QWEN_DIR}/Qwen3-30B-dbo-test.sh"
+QWEN_MODEL=${QWEN_MODEL:-/data/models/Qwen3-30B/Qwen3-30B}
 
 # ── 基础参数（与已有脚本默认值严格对齐）────────────────────────────────────
 MODEL=${MODEL:-/data/models/DeepSeek-V2-Lite-Chat}
@@ -40,7 +54,22 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8001}                        # 与 server 脚本默认 8001 对齐
 TP=${TP:-2}
 DEVICES=${DEVICES:-0,1}
+BASE_MODEL="$MODEL"
+BASE_TP="$TP"
 DRY_RUN=${DRY_RUN:-0}
+# TEST_GROUPS accepts a comma- or space-separated group list, or "all".
+# TEST_PLAN is retained as a backwards-compatible alias for older invocations.
+TEST_GROUPS=${TEST_GROUPS:-${TEST_PLAN:-p0_deepseek_tp}}
+TEST_PLAN=${TEST_PLAN:-$TEST_GROUPS}
+DEBUG_VALIDATION=${DEBUG_VALIDATION:-1}
+PERFORMANCE_RUN=${PERFORMANCE_RUN:-1}
+BENCH_PRESETS_EXPLICIT=${BENCH_PRESETS+x}
+
+# The validation and performance lanes must not share compile/cache artifacts.
+RUN_ROOT=${RUN_ROOT:-${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/testbench/results}/runs}
+SOURCE_ENV=${SOURCE_ENV:-1}
+VENV_ROOT=${VENV_ROOT:-/data/workspace/vllm-dbo-v0221/.venv-dbo}
+ENV_SCRIPT=${ENV_SCRIPT:-/data/workspace/vllm-dbo-v0221/env.sh}
 
 # ── 超时 / 冷却 ─────────────────────────────────────────────────────────────
 SERVER_START_TIMEOUT=${SERVER_START_TIMEOUT:-600}
@@ -58,6 +87,8 @@ DEEP_CLEANUP=${DEEP_CLEANUP:-1}
 # ── DBO 阈值（与 deepseek-v2-dbo-server.sh 对齐）───────────────────────────
 DBO_PREFILL_TOKEN_THRESHOLD=${DBO_PREFILL_TOKEN_THRESHOLD:-1024}
 DBO_DECODE_TOKEN_THRESHOLD=${DBO_DECODE_TOKEN_THRESHOLD:-1000000000}
+DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD="$DBO_PREFILL_TOKEN_THRESHOLD"
+DEFAULT_DBO_DECODE_TOKEN_THRESHOLD="$DBO_DECODE_TOKEN_THRESHOLD"
 
 # ── FlashComm2 默认参数 ─────────────────────────────────────────────────────
 # FlashComm2 OTP group size. TP=2 时必须为 1（实现要求 OTP < TP 且 TP 可被 OTP 整除）。
@@ -65,29 +96,68 @@ FC2_PARALLEL_SIZE=${FC2_PARALLEL_SIZE:-1}
 FC2_OSHARED=${FC2_OSHARED:-1}
 
 # ── 结果 & 日志（OUT_DIR 与 deepseek-v2-dbo-test.sh 对齐）──────────────────
-OUT_DIR=${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/results}
-LOG_DIR=${LOG_DIR:-${DEMOS_DIR}}
+OUT_DIR=${OUT_DIR:-/data/workspace/vllm-dbo-v0221/vllm-ascend/testbench/MOE/dbo/testbench/results}
+LOG_DIR=${LOG_DIR:-${OUT_DIR}}
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="${LOG_DIR}/auto_benchmark_${TIMESTAMP}.log"
 RESULT_SUFFIX=${RESULT_SUFFIX:-_${TIMESTAMP}}
+RUN_ROOT="${RUN_ROOT}/${TIMESTAMP}"
+ACTIVE_LOG_FILE="$LOG_FILE"
 
 mkdir -p "$OUT_DIR" "$LOG_DIR"
+mkdir -p "$RUN_ROOT"
+
+if [[ "$SOURCE_ENV" == "1" ]]; then
+    # Ascend's set_env.sh probes optional shell variables such as ZSH_VERSION.
+    # Load external environment scripts without nounset, then restore it.
+    set +u
+    if [[ -f "$VENV_ROOT/bin/activate" ]]; then
+        # shellcheck disable=SC1090
+        source "$VENV_ROOT/bin/activate"
+    else
+        echo "WARNING: virtualenv not found: $VENV_ROOT/bin/activate" >&2
+    fi
+    if [[ -f "$ENV_SCRIPT" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_SCRIPT"
+    else
+        echo "WARNING: environment script not found: $ENV_SCRIPT" >&2
+    fi
+    set -u
+    export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+    export no_proxy="$NO_PROXY"
+fi
 
 
 # ── Config matrix ──────────────────────────────────────────────────────────
-# 格式: "NAME DBO FC1 FC2_PARALLEL FC2_OSHARED HCCL_MODE"
-# CONFIGS 环境变量可指定子集，如 CONFIGS="baseline dbo fc2"
+# 格式: "NAME FAMILY DBO FC1 FC2_PARALLEL FC2_OSHARED HCCL_MODE ADDITIONAL_CONFIG"
+# CONFIGS can select any subset of the named configurations for every selected
+# group. Without it, each test group supplies its own matrix.
 DEFAULT_CONFIGS=(
-  "baseline       0 0 0 0 AI_CPU"
-  "baseline_aiv   0 0 0 0 AIV"
-  "fc1            0 1 0 0 AI_CPU"
-  "fc1_aiv        0 1 0 0 AIV"
-  "fc2            0 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV"
-  "dbo            1 0 0 0 AI_CPU"
-  "dbo_aiv        1 0 0 0 AIV"
-  "dbo_fc1        1 1 0 0 AI_CPU"
-  "dbo_fc1_aiv    1 1 0 0 AIV"
-  "dbo_fc2        1 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV"
+  "baseline                    deepseek_tp 0 0 0 0 AI_CPU -"
+  "baseline_aiv                deepseek_tp 0 0 0 0 AIV -"
+  "fc1                         deepseek_tp 0 1 0 0 AI_CPU -"
+  "fc1_aiv                     deepseek_tp 0 1 0 0 AIV -"
+  "fc2                         deepseek_tp 0 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV -"
+  "dbo                         deepseek_tp 1 0 0 0 AI_CPU -"
+  "dbo_aiv                     deepseek_tp 1 0 0 0 AIV -"
+  "dbo_fc1                     deepseek_tp 1 1 0 0 AI_CPU -"
+  "dbo_fc1_aiv                 deepseek_tp 1 1 0 0 AIV -"
+  "dbo_fc2                     deepseek_tp 1 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV -"
+  "dp_shared_baseline          deepseek_dp 0 0 0 0 AI_CPU {\"multistream_overlap_shared_expert\":true}"
+  "dp_shared_dbo               deepseek_dp 1 0 0 0 AI_CPU {\"multistream_overlap_shared_expert\":true}"
+  "dp_baseline                 deepseek_dp 0 0 0 0 AI_CPU -"
+  "dp_dbo                      deepseek_dp 1 0 0 0 AI_CPU -"
+  "qwen_baseline               qwen_tp     0 0 0 0 AI_CPU -"
+  "qwen_baseline_aiv           qwen_tp     0 0 0 0 AIV -"
+  "qwen_fc1                    qwen_tp     0 1 0 0 AI_CPU -"
+  "qwen_fc1_aiv                qwen_tp     0 1 0 0 AIV -"
+  "qwen_fc2                    qwen_tp     0 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV -"
+  "qwen_dbo                    qwen_tp     1 0 0 0 AI_CPU -"
+  "qwen_dbo_aiv                qwen_tp     1 0 0 0 AIV -"
+  "qwen_dbo_fc1                qwen_tp     1 1 0 0 AI_CPU -"
+  "qwen_dbo_fc1_aiv            qwen_tp     1 1 0 0 AIV -"
+  "qwen_dbo_fc2                qwen_tp     1 1 ${FC2_PARALLEL_SIZE} ${FC2_OSHARED} AIV -"
 )
 
 # ── Benchmark presets（与 deepseek-v2-dbo-test.sh 对齐）─────────────────────
@@ -117,7 +187,18 @@ PRESET_OUTPUT_LEN[quick]=128
 PRESET_NUM_PROMPTS[quick]=200
 PRESET_MAX_CONCURRENCY[quick]=64
 
-# 默认只用 prefill4k；可通过逗号分隔指定多个，如 BENCH_PRESETS="prefill4k,prefill8k"
+PRESET_INPUT_LEN[prefill4k16]=4096
+PRESET_OUTPUT_LEN[prefill4k16]=16
+PRESET_NUM_PROMPTS[prefill4k16]=16
+PRESET_MAX_CONCURRENCY[prefill4k16]=16
+
+# Decode-focused workload. The low decode threshold is applied only for P2.
+PRESET_INPUT_LEN[decode]=128
+PRESET_OUTPUT_LEN[decode]=128
+PRESET_NUM_PROMPTS[decode]=128
+PRESET_MAX_CONCURRENCY[decode]=64
+
+# Each test group's default workload is set with its matrix below.
 BENCH_PRESETS=${BENCH_PRESETS:-"prefill4k"}
 
 
@@ -237,34 +318,50 @@ cleanup_device_processes() {
 log_msg() {
     local ts
     ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[${ts}] $*" | tee -a "$LOG_FILE"
+    if [[ "$ACTIVE_LOG_FILE" == "$LOG_FILE" ]]; then
+        echo "[${ts}] $*" >> "$LOG_FILE"
+    else
+        echo "[${ts}] $*" | tee -a "$ACTIVE_LOG_FILE" "$LOG_FILE" >/dev/null
+    fi
+    echo "[${ts}] $*"
 }
 
 log_section() {
-    echo "" | tee -a "$LOG_FILE"
-    echo "====================================================================" | tee -a "$LOG_FILE"
-    echo "$*" | tee -a "$LOG_FILE"
-    echo "====================================================================" | tee -a "$LOG_FILE"
+    log_msg ""
+    log_msg "===================================================================="
+    log_msg "$*"
+    log_msg "===================================================================="
 }
 
 validate_config() {
-    local name="$1" fc1="$2" fc2_par="$3" hccl="$4"
+    local name="$1" family="$2" fc1="$3" fc2_par="$4" hccl="$5"
+    local case_tp="$BASE_TP"
+    case "$family" in
+        deepseek_tp|qwen_tp) ;;
+        deepseek_dp)
+            case_tp=1
+            if [[ "$fc1" != "0" || "$fc2_par" != "0" ]]; then
+                log_msg "  ✗ 配置 [$name] 无效: DP=2/TP=1 不支持 FlashComm"
+                return 1
+            fi
+            ;;
+        *)
+            log_msg "  ✗ 配置 [$name] 无效: 未知 family=$family"
+            return 1
+            ;;
+    esac
     if [[ "$fc2_par" -gt 0 && "$hccl" != "AIV" ]]; then
         log_msg "  ✗ 配置 [$name] 无效: FlashComm2 要求 HCCL=AIV，当前为 $hccl"
         return 1
     fi
-    if [[ "$fc2_par" -gt 0 && "$fc2_par" -ge "$TP" ]]; then
-        log_msg "  ✗ 配置 [$name] 无效: FlashComm2 OTP size=$fc2_par 必须小于 TP=$TP"
+    if [[ "$fc2_par" -gt 0 && "$fc2_par" -ge "$case_tp" ]]; then
+        log_msg "  ✗ 配置 [$name] 无效: FlashComm2 OTP size=$fc2_par 必须小于 TP=$case_tp"
         return 1
     fi
-    if [[ "$fc2_par" -gt 0 && $((TP % fc2_par)) -ne 0 ]]; then
-        log_msg "  ✗ 配置 [$name] 无效: TP=$TP 必须能被 FlashComm2 OTP size=$fc2_par 整除"
+    if [[ "$fc2_par" -gt 0 && $((case_tp % fc2_par)) -ne 0 ]]; then
+        log_msg "  ✗ 配置 [$name] 无效: TP=$case_tp 必须能被 FlashComm2 OTP size=$fc2_par 整除"
         return 1
     fi
-    if [[ "$fc2_par" -gt 0 && "$fc1" -eq 0 ]]; then
-        log_msg "  ⚠ 配置 [$name]: FlashComm2 开启但 FC1=0，结果可能异常"
-    fi
-    return 0
 }
 
 wait_server() {
@@ -291,49 +388,80 @@ wait_server() {
 }
 
 start_server() {
-    local name="$1" dbo="$2" fc1="$3" fc2_par="$4" fc2_osh="$5" hccl="$6"
+    local name="$1" family="$2" dbo="$3" fc1="$4" fc2_par="$5" fc2_osh="$6" hccl="$7" additional_config="$8" run_mode="${9:-perf}"
+    local server_script case_model="$BASE_MODEL" case_tp="$BASE_TP" case_dp=1 case_dp_local=1
+    local cache_root="${RUN_ROOT}/${run_mode}/${name}"
+    mkdir -p "$cache_root/xdg" "$cache_root/torchinductor" "$cache_root/vllm-compile"
+
+    case "$family" in
+        deepseek_tp)
+            server_script=$([[ "$dbo" == 1 ]] && printf "%s" "$SERVER_DBO" || printf "%s" "$SERVER_BASELINE")
+            ;;
+        deepseek_dp)
+            server_script="$SERVER_DP"
+            case_tp=1
+            case_dp=2
+            case_dp_local=2
+            ;;
+        qwen_tp)
+            case_model="$QWEN_MODEL"
+            server_script=$([[ "$dbo" == 1 ]] && printf "%s" "$QWEN_SERVER_DBO" || printf "%s" "$QWEN_SERVER_BASELINE")
+            ;;
+        *)
+            log_msg "  ✗ 不支持的 family: $family"
+            return 2
+            ;;
+    esac
 
     log_msg ""
     log_msg "  ── 启动 Server ─────────────────────────────────────"
-    log_msg "  Config : $name"
+    log_msg "  Config : $name (family=$family)"
     log_msg "  DBO    : $dbo   FC1: $fc1   FC2: par=${fc2_par} oshared=${fc2_osh}"
-    log_msg "  HCCL   : $hccl"
-    log_msg "  Port   : $PORT   TP: $TP   Devices: $DEVICES"
+    log_msg "  HCCL   : $hccl   TP: $case_tp   DP: $case_dp"
+    log_msg "  Model  : $case_model"
+    log_msg "  Mode   : $run_mode"
+    log_msg "  Cache  : $cache_root"
+    [[ "$additional_config" == "-" ]] || log_msg "  ADDITIONAL_CONFIG: $additional_config"
 
-    # ── 导出环境变量，覆盖已有脚本的 ${VAR:-default} ──
     export VLLM_USE_MODELSCOPE=${VLLM_USE_MODELSCOPE:-false}
     export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
     export ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
-
     export HCCL_OP_EXPANSION_MODE="$hccl"
     export VLLM_ASCEND_ENABLE_FLASHCOMM1="$fc1"
     export VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE="$fc2_par"
     export VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED="$fc2_osh"
     export VLLM_ASCEND_ENABLE_DBO="$dbo"
-    export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
-
-    export DBO_PREFILL_TOKEN_THRESHOLD
-    export DBO_DECODE_TOKEN_THRESHOLD
-    export PORT MODEL HOST TP
+    if [[ "$run_mode" == "debug" ]]; then
+        export VLLM_LOGGING_LEVEL="${DEBUG_LOG_LEVEL:-DEBUG}"
+    else
+        export VLLM_LOGGING_LEVEL="${PERF_LOG_LEVEL:-INFO}"
+    fi
+    export DBO_PREFILL_TOKEN_THRESHOLD DBO_DECODE_TOKEN_THRESHOLD
+    export XDG_CACHE_HOME="$cache_root/xdg"
+    export TORCHINDUCTOR_CACHE_DIR="$cache_root/torchinductor"
+    export VLLM_COMPILE_CACHE_PATH="$cache_root/vllm-compile"
+    export MODEL="$case_model" PORT HOST TP="$case_tp"
+    export DP="$case_dp" DP_LOCAL="$case_dp_local"
     export MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
     export MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
     export MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
-
-    # ── 选择 server 脚本 ──
-    local server_script
-    if [[ "$dbo" == "1" ]]; then
-        server_script="$SERVER_DBO"
+    if [[ "$family" == "deepseek_dp" ]]; then
+        export DBO_ENABLED="$dbo"
     else
-        server_script="$SERVER_BASELINE"
+        unset DBO_ENABLED
+    fi
+    if [[ "$additional_config" == "-" ]]; then
+        unset ADDITIONAL_CONFIG
+    else
+        export ADDITIONAL_CONFIG="$additional_config"
     fi
 
-    if [[ "$DRY_RUN" == "1" ]]; then
-        log_msg "  [DRY-RUN] bash ${server_script}"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log_msg "  [DRY-RUN] bash $server_script"
         SERVER_PID=""
         return 0
     fi
 
-    # 确保端口未被占用
     local existing
     existing=$(lsof -ti :"$PORT" 2>/dev/null || true)
     if [[ -n "$existing" ]]; then
@@ -342,13 +470,10 @@ start_server() {
         sleep 3
     fi
 
-    log_msg "  启动: setsid bash ${server_script}"
-    # 使用 setsid 创建独立的进程组，确保后续能一次性清理整个进程树
-    # (包括 vllm serve 及其 multiprocessing spawn 出的所有 worker)
-    setsid bash -c "bash \"${server_script}\" 2>&1 | tee -a \"${LOG_FILE}\"" &
+    log_msg "  启动: setsid bash $server_script"
+    setsid bash -c "bash \"${server_script}\" 2>&1 | tee -a \"${ACTIVE_LOG_FILE}\"" &
     SERVER_PID=$!
     log_msg "  Server PID = $SERVER_PID"
-
     if ! wait_server; then
         log_msg "  ✗ Server 启动失败，跳过此配置"
         stop_server
@@ -407,40 +532,56 @@ stop_server() {
 }
 
 run_benchmark() {
-    # 调用已有的 deepseek-v2-dbo-test.sh，完全对齐手动压测
-    local config_name="$1"
-    local preset_name="$2"
+    local config_name="$1" family="$2" preset_name="$3" result_label="${4:-$config_name}" run_mode="${5:-perf}"
+    local case_model="$BASE_MODEL" case_test_script="$TEST_SCRIPT"
+    if [[ "$family" == "qwen_tp" ]]; then
+        case_model="$QWEN_MODEL"
+        case_test_script="$QWEN_TEST_SCRIPT"
+    fi
 
     local il=${PRESET_INPUT_LEN[$preset_name]}
     local ol=${PRESET_OUTPUT_LEN[$preset_name]}
     local np=${PRESET_NUM_PROMPTS[$preset_name]}
     local mc=${PRESET_MAX_CONCURRENCY[$preset_name]}
+    local test_preset="$preset_name"
+    case "$preset_name" in
+        prefill4k16|decode) test_preset=custom ;;
+    esac
 
     log_msg ""
     log_msg "    ── 压测: ${config_name} / ${preset_name} ───────────────"
     log_msg "    input=${il}  output=${ol}  prompts=${np}  conc=${mc}"
 
     # 计算期望的结果文件路径（与 deepseek-v2-dbo-test.sh 命名规则一致）
-    local expected_result="${OUT_DIR}/${config_name}_in${il}_out${ol}_np${np}_c${mc}${RESULT_SUFFIX}.json"
+    local result_dir="${OUT_DIR}/${run_mode}"
+    local mode_suffix="${RESULT_SUFFIX}_${run_mode}"
+    local expected_result="${result_dir}/${result_label}_in${il}_out${ol}_np${np}_c${mc}${mode_suffix}.json"
+    mkdir -p "$result_dir"
 
     if [[ "$DRY_RUN" == "1" ]]; then
-        log_msg "    [DRY-RUN] LABEL=${config_name} BENCH_PRESET=${preset_name} PORT=${PORT} bash ${TEST_SCRIPT}"
+        log_msg "    [DRY-RUN] LABEL=${result_label} MODE=${run_mode} BENCH_PRESET=${test_preset} PORT=${PORT} bash ${case_test_script}"
         log_msg "    [DRY-RUN] → expected result: $expected_result"
         return 0
     fi
 
     # 调已有的 test 脚本（single 模式）
-    if LABEL="$config_name" \
-       BENCH_PRESET="$preset_name" \
+    if LABEL="$result_label" \
+       BENCH_PRESET="$test_preset" \
+       INPUT_LEN="$il" \
+       OUTPUT_LEN="$ol" \
+       NUM_PROMPTS="$np" \
+       MAX_CONCURRENCY="$mc" \
        PORT="$PORT" \
-       MODEL="$MODEL" \
+       MODEL="$case_model" \
        HOST="$HOST" \
-       OUT_DIR="$OUT_DIR" \
-       RESULT_SUFFIX="$RESULT_SUFFIX" \
-       bash "$TEST_SCRIPT" 2>&1 | tee -a "$LOG_FILE"; then
+       OUT_DIR="$result_dir" \
+       RESULT_SUFFIX="${mode_suffix}" \
+       bash "$case_test_script" 2>&1 | tee -a "$ACTIVE_LOG_FILE" "$LOG_FILE"; then
 
         if [[ -f "$expected_result" ]]; then
-            GENERATED_RESULTS+=("$expected_result")
+            if [[ "$run_mode" == "perf" ]]; then
+                GENERATED_RESULTS+=("$expected_result")
+            fi
             log_msg "    ✓ 结果: $expected_result"
             extract_metrics "$expected_result" "    "
         else
@@ -490,12 +631,100 @@ PYEOF
 }
 
 check_dbo_trigger() {
+    local config_name="$1" family="$2" log_file="${3:-$ACTIVE_LOG_FILE}"
     if [[ "$DRY_RUN" == "1" ]]; then
-        return
+        log_msg "  [DRY-RUN] DBO validation: ${config_name} (${family})"
+        return 0
     fi
-    local count
-    count=$(grep -c "should_ubatch: True" "$LOG_FILE" 2>/dev/null || true)
-    log_msg "  DBO ubatch 触发次数 (累计): ${count:-0}"
+    if [[ ! -f "$log_file" ]]; then
+        log_msg "  ✗ DBO validation failed: log not found: $log_file"
+        return 1
+    fi
+
+    local expected_workers=2
+    local evidence
+    local rc=0
+    if ! evidence=$(python3 - "$log_file" "$expected_workers" <<'PYEOF'
+import re, sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(errors="replace")
+workers = sorted(set(re.findall(r"(Worker_(?:TP|DP)\\d+(?:_EP\\d+)?)", text)))
+hits = sorted(set(re.findall(r"(Worker_(?:TP|DP)\\d+(?:_EP\\d+)?).*should_ubatch: True", text)))
+print(f"workers={','.join(workers) or '-'}")
+print(f"hits={','.join(hits) or '-'}")
+print(f"hit_count={len(hits)}")
+sys.exit(0 if len(hits) >= int(sys.argv[2]) else 1)
+PYEOF
+    ); then
+        rc=1
+    fi
+    while IFS= read -r line; do
+        log_msg "  DBO validation ${config_name}: ${line}"
+    done <<< "$evidence"
+    if [[ "$rc" -ne 0 ]]; then
+        log_msg "  ✗ DBO validation failed for ${config_name}; performance run remains scheduled"
+    else
+        log_msg "  ✓ DBO validation passed for ${config_name}"
+    fi
+    return "$rc"
+}
+
+run_server_benchmark() {
+    local name="$1" family="$2" dbo="$3" fc1="$4" fc2p="$5" fc2o="$6" hccl="$7" additional="$8"
+    local preset="$9" mode="${10}" label="${11}"
+
+    if ! start_server "$name" "$family" "$dbo" "$fc1" "$fc2p" "$fc2o" "$hccl" "$additional" "$mode"; then
+        return 1
+    fi
+    local rc=0
+    if ! run_benchmark "$name" "$family" "$preset" "$label" "$mode"; then
+        rc=1
+    fi
+    stop_server || rc=1
+    return "$rc"
+}
+
+run_config_case() {
+    local cname="$1" family="$2" dbo="$3" fc1="$4" fc2p="$5" fc2o="$6" hccl="$7" additional="$8" preset="$9"
+    local config_rc=0
+
+    # Validation is intentionally separate from performance. DEBUG logs and
+    # evidence parsing are never used as performance measurements.
+    if [[ "$dbo" == "1" && "$DEBUG_VALIDATION" == "1" ]]; then
+        ACTIVE_LOG_FILE="${RUN_ROOT}/debug/${cname}_${preset}.server.log"
+        mkdir -p "$(dirname "$ACTIVE_LOG_FILE")"
+        if ! run_server_benchmark "$cname" "$family" "$dbo" "$fc1" "$fc2p" "$fc2o" "$hccl" "$additional" "$preset" debug "${cname}_debug"; then
+            VALIDATION_FAILURES+=("${cname}/${preset} (debug benchmark)")
+            config_rc=1
+        fi
+        if ! check_dbo_trigger "$cname" "$family" "$ACTIVE_LOG_FILE"; then
+            VALIDATION_FAILURES+=("${cname}/${preset} (missing worker evidence)")
+            config_rc=1
+        fi
+    fi
+
+    if [[ "$PERFORMANCE_RUN" != "1" ]]; then
+        return "$config_rc"
+    fi
+
+    # DBO cases get a matched baseline with the same communication settings.
+    if [[ "$dbo" == "1" ]]; then
+        ACTIVE_LOG_FILE="${RUN_ROOT}/perf/${cname}_baseline_${preset}.server.log"
+        mkdir -p "$(dirname "$ACTIVE_LOG_FILE")"
+        if ! run_server_benchmark "${cname}_baseline" "$family" 0 "$fc1" "$fc2p" "$fc2o" "$hccl" "$additional" "$preset" perf "${cname}_baseline"; then
+            PERFORMANCE_FAILURES+=("${cname}/${preset}/baseline")
+            config_rc=1
+        fi
+    fi
+
+    ACTIVE_LOG_FILE="${RUN_ROOT}/perf/${cname}_${preset}.server.log"
+    mkdir -p "$(dirname "$ACTIVE_LOG_FILE")"
+    if ! run_server_benchmark "$cname" "$family" "$dbo" "$fc1" "$fc2p" "$fc2o" "$hccl" "$additional" "$preset" perf "$cname"; then
+        PERFORMANCE_FAILURES+=("${cname}/${preset}/${dbo:+dbo}")
+        config_rc=1
+    fi
+    return "$config_rc"
 }
 
 print_summary_table() {
@@ -609,6 +838,102 @@ print(f"  └" + "─" * 60)
 PYEOF
 }
 
+generate_report() {
+    local report_file="${OUT_DIR}/benchmark_report_${TIMESTAMP}.md"
+    python3 - "$report_file" "$BASE_MODEL" "$TEST_PLAN" "$RUN_ROOT" "${GENERATED_RESULTS[@]}" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+report, model, plan, run_root, *files = sys.argv[1:]
+entries = {}
+for filename in files:
+    try:
+        data = json.loads(Path(filename).read_text())
+    except (OSError, json.JSONDecodeError):
+        continue
+    label = Path(filename).name.split("_in", 1)[0]
+    entries[label] = data
+
+metrics = (
+    ("output_throughput", "Output throughput (tok/s)", True),
+    ("request_throughput", "Request throughput (req/s)", True),
+    ("mean_ttft_ms", "Mean TTFT (ms)", False),
+    ("p99_ttft_ms", "P99 TTFT (ms)", False),
+    ("mean_tpot_ms", "Mean TPOT (ms/tok)", False),
+    ("p99_tpot_ms", "P99 TPOT (ms/tok)", False),
+    ("mean_itl_ms", "Mean ITL (ms)", False),
+    ("p99_itl_ms", "P99 ITL (ms)", False),
+    ("mean_e2el_ms", "Mean E2E (ms)", False),
+    ("p99_e2el_ms", "P99 E2E (ms)", False),
+)
+
+lines = [
+    "# DBO Benchmark Report",
+    "",
+    f"- Model: `{model}`",
+    f"- Test plan: `{plan}`",
+    f"- Run artifacts: `{run_root}`",
+    "- Performance data is collected with INFO logging; DEBUG validation is separate.",
+    "",
+    "## Performance Comparison",
+    "",
+]
+
+dbo_labels = sorted(label for label in entries if not label.endswith("_baseline"))
+if not dbo_labels:
+    lines.append("No performance result JSON was produced.")
+for label in dbo_labels:
+    current = entries[label]
+    baseline = entries.get(f"{label}_baseline")
+    lines.extend([f"### {label}", "", "| Metric | Baseline | Current | Delta |", "|---|---:|---:|---:|"])
+    for key, display, higher_is_better in metrics:
+        value = current.get(key)
+        base = baseline.get(key) if baseline else None
+        if isinstance(value, (int, float)) and isinstance(base, (int, float)) and base:
+            delta = (value - base) / base * 100
+            if not higher_is_better:
+                delta = -delta
+            base_text, value_text, delta_text = f"{base:.2f}", f"{value:.2f}", f"{delta:+.2f}%"
+        else:
+            base_text = f"{base:.2f}" if isinstance(base, (int, float)) else "N/A"
+            value_text = f"{value:.2f}" if isinstance(value, (int, float)) else "N/A"
+            delta_text = "N/A"
+        lines.append(f"| {display} | {base_text} | {value_text} | {delta_text} |")
+    lines.append("")
+
+Path(report).write_text("\n".join(lines) + "\n")
+PYEOF
+
+    {
+        echo "## Validation And Failures"
+        echo ""
+        echo "Debug server logs are under: \`$RUN_ROOT/debug\`."
+        echo ""
+        echo "### DBO Validation Failures"
+        if [[ ${#VALIDATION_FAILURES[@]} -eq 0 ]]; then
+            echo "None."
+        else
+            for item in "${VALIDATION_FAILURES[@]}"; do echo "- $item"; done
+        fi
+        echo ""
+        echo "### Performance Failures"
+        if [[ ${#PERFORMANCE_FAILURES[@]} -eq 0 ]]; then
+            echo "None."
+        else
+            for item in "${PERFORMANCE_FAILURES[@]}"; do echo "- $item"; done
+        fi
+        echo ""
+        echo "### Configuration Failures"
+        if [[ ${#FAILED_CONFIGS[@]} -eq 0 ]]; then
+            echo "None."
+        else
+            for item in "${FAILED_CONFIGS[@]}"; do echo "- $item"; done
+        fi
+    } >> "$report_file"
+    log_msg "  Report   : $report_file"
+}
+
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
@@ -624,8 +949,7 @@ cleanup() {
 
 SERVER_PID=""
 GENERATED_RESULTS=()
-FAILED_BENCHMARKS=()
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # 初始化日志
 {
@@ -635,9 +959,9 @@ trap cleanup EXIT INT TERM
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║  Started   : $(date '+%Y-%m-%d %H:%M:%S')"
     echo "║  Log file  : $LOG_FILE"
-    echo "║  Model     : $MODEL"
+    echo "║  Model     : $BASE_MODEL"
     echo "║  Devices   : $DEVICES"
-    echo "║  TP        : $TP"
+    echo "║  TP        : $BASE_TP"
     echo "║  Port      : $PORT"
     echo "║  Git       : $(git -C "$DEMOS_DIR" rev-parse --short HEAD 2>/dev/null || echo 'N/A')"
     echo "║  Dry run   : $DRY_RUN"
@@ -649,103 +973,161 @@ trap cleanup EXIT INT TERM
     echo ""
 } | tee "$LOG_FILE"
 
-# 解析 presets
-read -ra PRESET_NAMES <<< "${BENCH_PRESETS//,/ }"
-for pn in "${PRESET_NAMES[@]}"; do
-    pn=$(echo "$pn" | xargs)
-    if [[ -z "${PRESET_INPUT_LEN[$pn]:-}" ]]; then
-        log_msg "✗ 未知 preset: $pn"
-        log_msg "  可用: prefill4k ttft4k prefill8k quick"
-        exit 1
+# Named test groups map directly to testbench/task.md. A DBO case runs its
+# matched baseline automatically, so no duplicate baseline entry is needed.
+declare -A GROUP_CONFIGS GROUP_PRESETS GROUP_DECODE_THRESHOLDS
+GROUP_ORDER=(
+    p0_deepseek_tp
+    p0_deepseek_dp
+    p0_deepseek_dp_shared_expert
+    p1_deepseek_small_batch
+    p1_qwen_tp
+    p2_deepseek_decode
+)
+GROUP_CONFIGS[p0_deepseek_tp]="baseline dbo fc1 fc1_aiv dbo_fc1 dbo_fc1_aiv dbo_fc2"
+GROUP_PRESETS[p0_deepseek_tp]="prefill4k"
+GROUP_CONFIGS[p0_deepseek_dp]="dp_baseline dp_dbo"
+GROUP_PRESETS[p0_deepseek_dp]="prefill4k"
+GROUP_CONFIGS[p0_deepseek_dp_shared_expert]="dp_shared_baseline dp_shared_dbo"
+GROUP_PRESETS[p0_deepseek_dp_shared_expert]="prefill4k"
+GROUP_CONFIGS[p1_deepseek_small_batch]="baseline dbo dp_baseline dp_dbo"
+GROUP_PRESETS[p1_deepseek_small_batch]="prefill4k16"
+GROUP_CONFIGS[p1_qwen_tp]="qwen_baseline qwen_dbo qwen_fc1 qwen_fc1_aiv qwen_dbo_fc1 qwen_dbo_fc1_aiv qwen_dbo_fc2"
+GROUP_PRESETS[p1_qwen_tp]="prefill4k"
+GROUP_CONFIGS[p2_deepseek_decode]="dbo"
+GROUP_PRESETS[p2_deepseek_decode]="decode"
+GROUP_DECODE_THRESHOLDS[p2_deepseek_decode]="${P2_DECODE_TOKEN_THRESHOLD:-32}"
+
+select_groups() {
+    local requested="$1" group
+    if [[ "$requested" == "all" ]]; then
+        SELECTED_GROUPS=("${GROUP_ORDER[@]}")
+        return
     fi
-done
 
-log_msg "Benchmark presets (${#PRESET_NAMES[@]}):"
-for pn in "${PRESET_NAMES[@]}"; do
-    pn=$(echo "$pn" | xargs)
-    log_msg "  - ${pn}: in=${PRESET_INPUT_LEN[$pn]} out=${PRESET_OUTPUT_LEN[$pn]} prompts=${PRESET_NUM_PROMPTS[$pn]} conc=${PRESET_MAX_CONCURRENCY[$pn]}"
-done
+    SELECTED_GROUPS=()
+    read -ra requested_groups <<< "${requested//,/ }"
+    for group in "${requested_groups[@]}"; do
+        case "$group" in
+            # Compatibility aliases for earlier versions of this script.
+            p0) SELECTED_GROUPS+=(p0_deepseek_tp p0_deepseek_dp p0_deepseek_dp_shared_expert) ;;
+            p1) SELECTED_GROUPS+=(p1_deepseek_small_batch p1_qwen_tp) ;;
+            p2) SELECTED_GROUPS+=(p2_deepseek_decode) ;;
+            qwen) SELECTED_GROUPS+=(p1_qwen_tp) ;;
+            *)
+                if [[ -z "${GROUP_CONFIGS[$group]:-}" ]]; then
+                    echo "Unknown TEST_GROUPS entry: $group" >&2
+                    echo "Available: ${GROUP_ORDER[*]} all" >&2
+                    exit 2
+                fi
+                SELECTED_GROUPS+=("$group")
+                ;;
+        esac
+    done
+    if [[ ${#SELECTED_GROUPS[@]} -eq 0 ]]; then
+        echo "TEST_GROUPS must name at least one test group" >&2
+        exit 2
+    fi
+}
 
-# 解析 configs
-CONFIGS_STR="${CONFIGS:-}"
-if [[ -n "$CONFIGS_STR" ]]; then
-    IFS=' ' read -ra CONFIG_NAMES <<< "$CONFIGS_STR"
-    CONFIGS_TO_RUN=()
+find_config() {
+    local wanted="$1" def dname
+    for def in "${DEFAULT_CONFIGS[@]}"; do
+        read -r dname _ <<< "$def"
+        if [[ "$dname" == "$wanted" ]]; then
+            printf '%s\n' "$def"
+            return 0
+        fi
+    done
+    return 1
+}
+
+list_config_names() {
+    local def name
+    for def in "${DEFAULT_CONFIGS[@]}"; do
+        read -r name _ <<< "$def"
+        printf '%s ' "$name"
+    done
+}
+
+FAILED_CONFIGS=()
+VALIDATION_FAILURES=()
+PERFORMANCE_FAILURES=()
+TOTAL=0
+CURRENT=0
+
+select_groups "$TEST_GROUPS"
+
+# Validate and count every requested case before any server starts. This makes
+# invalid input fail fast and keeps progress counts correct for multi-group runs.
+for group_name in "${SELECTED_GROUPS[@]}"; do
+    config_names="${CONFIGS:-${GROUP_CONFIGS[$group_name]}}"
+    if [[ -n "$BENCH_PRESETS_EXPLICIT" ]]; then
+        preset_names="$BENCH_PRESETS"
+    else
+        preset_names="${GROUP_PRESETS[$group_name]}"
+    fi
+    read -ra CONFIG_NAMES <<< "${config_names//,/ }"
+    read -ra PRESET_NAMES <<< "${preset_names//,/ }"
     for cname in "${CONFIG_NAMES[@]}"; do
-        found=0
-        for def in "${DEFAULT_CONFIGS[@]}"; do
-            read -r dname rest <<< "$def"
-            if [[ "$dname" == "$cname" ]]; then
-                CONFIGS_TO_RUN+=("$def")
-                found=1
-                break
-            fi
-        done
-        if [[ "$found" -eq 0 ]]; then
-            log_msg "✗ 未知 config: $cname"
-            log_msg "  可用: baseline baseline_aiv fc1 fc1_aiv fc2 dbo dbo_aiv dbo_fc1 dbo_fc1_aiv dbo_fc2"
+        if ! find_config "$cname" >/dev/null; then
+            log_msg "✗ Unknown config: $cname"
+            log_msg "  Available: $(list_config_names)"
             exit 2
         fi
     done
-else
-    CONFIGS_TO_RUN=("${DEFAULT_CONFIGS[@]}")
-fi
-
-log_msg ""
-log_msg "Configurations (${#CONFIGS_TO_RUN[@]}):"
-for cfg in "${CONFIGS_TO_RUN[@]}"; do
-    read -r cname dbo fc1 fc2p fc2o hccl <<< "$cfg"
-    fc2_str="off"
-    [[ "$fc2p" -gt 0 ]] && fc2_str="on(p=${fc2p},oshared=${fc2o})"
-    log_msg "  - ${cname}: DBO=${dbo} FC1=${fc1} FC2=${fc2_str} HCCL=${hccl}"
-done
-
-# ── 主循环 ─────────────────────────────────────────────────────────────────
-TOTAL=${#CONFIGS_TO_RUN[@]}
-CURRENT=0
-FAILED_CONFIGS=()
-
-for cfg in "${CONFIGS_TO_RUN[@]}"; do
-    CURRENT=$((CURRENT + 1))
-    read -r cname dbo fc1 fc2p fc2o hccl <<< "$cfg"
-
-    log_section "[${CURRENT}/${TOTAL}] Config: ${cname}"
-
-    if ! validate_config "$cname" "$fc1" "$fc2p" "$hccl"; then
-        FAILED_CONFIGS+=("$cname (验证失败)")
-        continue
-    fi
-
-    # 启动 server（复用已有脚本）
-    if ! start_server "$cname" "$dbo" "$fc1" "$fc2p" "$fc2o" "$hccl"; then
-        FAILED_CONFIGS+=("$cname (server 启动失败)")
-        continue
-    fi
-
-    # 对所有 preset 发压（复用已有脚本）
-    preset_idx=0
     for pn in "${PRESET_NAMES[@]}"; do
-        pn=$(echo "$pn" | xargs)
-        preset_idx=$((preset_idx + 1))
-        log_msg ""
-        log_msg "  [Preset ${preset_idx}/${#PRESET_NAMES[@]}: ${pn}]"
-
-        if ! run_benchmark "$cname" "$pn"; then
-            log_msg "  ⚠ Preset 失败，继续下一个"
-            FAILED_BENCHMARKS+=("${cname}/${pn}")
+        if [[ -z "${PRESET_INPUT_LEN[$pn]:-}" ]]; then
+            log_msg "✗ Unknown preset: $pn"
+            log_msg "  Available: prefill4k prefill4k16 decode ttft4k prefill8k quick"
+            exit 2
         fi
     done
+    TOTAL=$((TOTAL + ${#CONFIG_NAMES[@]} * ${#PRESET_NAMES[@]}))
+done
 
-    check_dbo_trigger
-    stop_server
-
-    log_msg "  ✓ 配置 [$cname] 完成"
-    log_msg ""
-
-    if [[ "$DRY_RUN" != "1" && "$CURRENT" -lt "$TOTAL" ]]; then
-        log_msg "  缓冲 ${INTER_CONFIG_SLEEP}s (显存已在 stop_server 中回收) ..."
-        sleep "$INTER_CONFIG_SLEEP"
+for group_name in "${SELECTED_GROUPS[@]}"; do
+    DBO_PREFILL_TOKEN_THRESHOLD=$DEFAULT_DBO_PREFILL_TOKEN_THRESHOLD
+    DBO_DECODE_TOKEN_THRESHOLD=$DEFAULT_DBO_DECODE_TOKEN_THRESHOLD
+    if [[ -n "${GROUP_DECODE_THRESHOLDS[$group_name]:-}" ]]; then
+        DBO_DECODE_TOKEN_THRESHOLD=${GROUP_DECODE_THRESHOLDS[$group_name]}
     fi
+
+    config_names="${CONFIGS:-${GROUP_CONFIGS[$group_name]}}"
+    if [[ -n "$BENCH_PRESETS_EXPLICIT" ]]; then
+        preset_names="$BENCH_PRESETS"
+    else
+        preset_names="${GROUP_PRESETS[$group_name]}"
+    fi
+    read -ra CONFIG_NAMES <<< "${config_names//,/ }"
+    read -ra PRESET_NAMES <<< "${preset_names//,/ }"
+    CONFIGS_TO_RUN=()
+    for cname in "${CONFIG_NAMES[@]}"; do
+        CONFIGS_TO_RUN+=("$(find_config "$cname")")
+    done
+
+    log_section "TEST GROUP: ${group_name}"
+    log_msg "Configurations (${#CONFIGS_TO_RUN[@]}): ${config_names}"
+    log_msg "Workloads (${#PRESET_NAMES[@]}): ${preset_names}"
+    [[ -n "${GROUP_DECODE_THRESHOLDS[$group_name]:-}" ]] && log_msg "DBO decode threshold: ${DBO_DECODE_TOKEN_THRESHOLD}"
+
+    for cfg in "${CONFIGS_TO_RUN[@]}"; do
+        read -r cname family dbo fc1 fc2p fc2o hccl additional_config <<< "$cfg"
+        if ! validate_config "$cname" "$family" "$fc1" "$fc2p" "$hccl"; then
+            FAILED_CONFIGS+=("${group_name}/${cname} (invalid configuration)")
+            continue
+        fi
+        for pn in "${PRESET_NAMES[@]}"; do
+            CURRENT=$((CURRENT + 1))
+            log_section "[${CURRENT}/${TOTAL}] ${group_name}: ${cname}/${pn}"
+            if ! run_config_case "$cname" "$family" "$dbo" "$fc1" "$fc2p" "$fc2o" "$hccl" "$additional_config" "$pn"; then
+                FAILED_CONFIGS+=("${group_name}/${cname}/${pn}")
+            fi
+            if [[ "$DRY_RUN" != "1" && "$CURRENT" -lt "$TOTAL" ]]; then
+                sleep "$INTER_CONFIG_SLEEP"
+            fi
+        done
+    done
 done
 
 # ── 报告失败的配置 ─────────────────────────────────────────────────────────
@@ -756,9 +1138,16 @@ if [[ ${#FAILED_CONFIGS[@]} -gt 0 ]]; then
     done
 fi
 
-if [[ ${#FAILED_BENCHMARKS[@]} -gt 0 ]]; then
-    log_section "FAILED BENCHMARKS"
-    for f in "${FAILED_BENCHMARKS[@]}"; do
+if [[ ${#VALIDATION_FAILURES[@]} -gt 0 ]]; then
+    log_section "FAILED DBO VALIDATIONS"
+    for f in "${VALIDATION_FAILURES[@]}"; do
+        log_msg "  ✗ $f"
+    done
+fi
+
+if [[ ${#PERFORMANCE_FAILURES[@]} -gt 0 ]]; then
+    log_section "FAILED PERFORMANCE RUNS"
+    for f in "${PERFORMANCE_FAILURES[@]}"; do
         log_msg "  ✗ $f"
     done
 fi
@@ -766,20 +1155,22 @@ fi
 # ── Summary ─────────────────────────────────────────────────────────────────
 log_section "BENCHMARK SUMMARY"
 log_msg ""
-log_msg "  Model    : $MODEL"
+log_msg "  Model    : $BASE_MODEL"
 log_msg "  Devices  : $DEVICES"
-log_msg "  TP       : $TP"
+log_msg "  TP       : $BASE_TP"
 log_msg "  Port     : $PORT"
 log_msg "  Git      : $(git -C "$DEMOS_DIR" rev-parse --short HEAD 2>/dev/null || echo 'N/A')"
 log_msg "  Log file : $LOG_FILE"
 
 print_summary_table
+generate_report
 
 log_section "DONE"
 log_msg "  完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
 log_msg "  成功    : $((TOTAL - ${#FAILED_CONFIGS[@]}))/${TOTAL}"
 log_msg "  失败    : ${#FAILED_CONFIGS[@]}"
-log_msg "  压测失败: ${#FAILED_BENCHMARKS[@]}"
+log_msg "  DBO 验证失败: ${#VALIDATION_FAILURES[@]}"
+log_msg "  性能测试失败: ${#PERFORMANCE_FAILURES[@]}"
 log_msg "  Log     : $LOG_FILE"
 log_msg "  Results : $OUT_DIR"
 log_msg ""
@@ -790,6 +1181,6 @@ log_msg "    grep 'should_ubatch: True' $LOG_FILE"
 log_msg "  查看完整 server 日志："
 log_msg "    grep -n 'Config:' $LOG_FILE"
 
-if [[ ${#FAILED_CONFIGS[@]} -gt 0 || ${#FAILED_BENCHMARKS[@]} -gt 0 ]]; then
+if [[ ${#FAILED_CONFIGS[@]} -gt 0 || ${#VALIDATION_FAILURES[@]} -gt 0 || ${#PERFORMANCE_FAILURES[@]} -gt 0 ]]; then
     exit 1
 fi

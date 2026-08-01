@@ -90,6 +90,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 # DBO 需要足够大的 batch token 才有意义
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG:-}
 
 
 # ------------------------------------------------------------
@@ -155,6 +156,7 @@ echo "  TP                                  = $TP"
 echo "  MAX_MODEL_LEN                       = $MAX_MODEL_LEN"
 echo "  MAX_NUM_BATCHED_TOKENS              = $MAX_NUM_BATCHED_TOKENS"
 echo "  MAX_NUM_SEQS                        = $MAX_NUM_SEQS"
+echo "  ADDITIONAL_CONFIG                   = ${ADDITIONAL_CONFIG:-<unset>}"
 echo ""
 echo "  --enable-dbo                        = ON"
 echo "  DBO_PREFILL_TOKEN_THRESHOLD          = $DBO_PREFILL_TOKEN_THRESHOLD"
@@ -196,7 +198,6 @@ serve_args=(
   --tensor-parallel-size "$TP"
   --enable-expert-parallel
 
-  --enable-dbo
   --all2all-backend deepep_low_latency
   --dbo-prefill-token-threshold "$DBO_PREFILL_TOKEN_THRESHOLD"
   --dbo-decode-token-threshold "$DBO_DECODE_TOKEN_THRESHOLD"
@@ -205,6 +206,19 @@ serve_args=(
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --max-num-seqs "$MAX_NUM_SEQS"
 )
+
+if [[ "${ENFORCE_EAGER:-0}" == "1" ]]; then
+  serve_args+=(--enforce-eager)
+fi
+
+if [[ -n "$ADDITIONAL_CONFIG" ]]; then
+  jq empty <<<"$ADDITIONAL_CONFIG"
+  serve_args+=(--additional-config "$ADDITIONAL_CONFIG")
+fi
+
+if [[ "$VLLM_ASCEND_ENABLE_DBO" == "1" ]]; then
+  serve_args+=(--enable-dbo)
+fi
 
 if [[ "$LOG_STATS" == "0" ]]; then
   serve_args+=(--disable-log-stats)
@@ -218,9 +232,11 @@ if [[ "$ENABLE_PROFILER" == "1" ]]; then
   # stop_profile flush 可能较慢，避免 RPC 超时
   export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-1800000}
 
-  # max_iterations applies to workers only. Disable the unbounded AsyncLLM
-  # frontend trace so the profile window and output size remain controlled.
-  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
+  # torch_npu must reach RECORD_AND_SAVE before it stops; stopping directly
+  # from RECORD can drop the CANN PROF_* export. Keep vLLM's own worker limit
+  # disabled and let the torch_npu schedule own the bounded capture window.
+  # The frontend remains disabled so only worker forward steps are captured.
+  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"warmup_iterations\":1,\"active_iterations\":${PROFILER_MAX_ITERATIONS},\"max_iterations\":0}"
 
   echo "  PROFILER_CONFIG                     = ${PROFILER_CONFIG}"
 

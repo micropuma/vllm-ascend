@@ -86,6 +86,7 @@ TP=${TP:-2}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG:-}
 
 
 # ------------------------------------------------------------
@@ -123,6 +124,7 @@ echo "  TP                                  = $TP"
 echo "  MAX_MODEL_LEN                       = $MAX_MODEL_LEN"
 echo "  MAX_NUM_BATCHED_TOKENS              = $MAX_NUM_BATCHED_TOKENS"
 echo "  MAX_NUM_SEQS                        = $MAX_NUM_SEQS"
+echo "  ADDITIONAL_CONFIG                   = ${ADDITIONAL_CONFIG:-<unset>}"
 echo ""
 echo "  --enable-dbo                        = OFF"
 echo "  VLLM_ASCEND_ENABLE_DBO               = $VLLM_ASCEND_ENABLE_DBO"
@@ -169,6 +171,11 @@ serve_args=(
 
 if [[ "$LOG_STATS" == "0" ]]; then
   serve_args+=(--disable-log-stats)
+fi
+
+if [[ -n "$ADDITIONAL_CONFIG" ]]; then
+  jq empty <<<"$ADDITIONAL_CONFIG"
+  serve_args+=(--additional-config "$ADDITIONAL_CONFIG")
 fi
 
 

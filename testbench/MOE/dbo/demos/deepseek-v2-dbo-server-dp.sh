@@ -103,6 +103,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+ADDITIONAL_CONFIG=${ADDITIONAL_CONFIG:-}
 
 
 # ------------------------------------------------------------
@@ -232,6 +233,11 @@ fi
 
 if [[ "$ENFORCE_EAGER" == "1" ]]; then
   serve_args+=(--enforce-eager)
+fi
+
+if [[ -n "$ADDITIONAL_CONFIG" ]]; then
+  jq empty <<<"$ADDITIONAL_CONFIG"
+  serve_args+=(--additional-config "$ADDITIONAL_CONFIG")
 fi
 
 if [[ "$LOG_STATS" == "0" ]]; then
