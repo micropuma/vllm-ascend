@@ -15,4 +15,4 @@ export no_proxy=127.0.0.1,localhost
 
 exec python3 "${QUICK_DIR}/run_quick_precision.py" \
   --flashcomm1 0 --tp-size 1 --dp-size 2 --dp-local 2 \
-  --server-script "${REPO_ROOT}/testbench/MOE/dbo/demos/deepseek-v2-dbo-server-dp.sh" "$@"
+  --server-script "${REPO_ROOT}/testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server-dp.sh" "$@"

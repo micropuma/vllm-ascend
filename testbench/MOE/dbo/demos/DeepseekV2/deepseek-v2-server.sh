@@ -190,8 +190,9 @@ if [[ "$ENABLE_PROFILER" == "1" ]]; then
   #   - torch_profiler_with_stack=true：采 Python call stack
   #   - torch_profiler_record_shapes=true：采 shape
   #   - torch_profiler_use_gzip=false：不压缩，方便 grep / 检查
-  #   - max_iterations：限制采集轮数，防止 trace 过大
-  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
+  # Keep the same torch_npu schedule as the DBO server. The vLLM worker
+  # max-iteration limiter stays disabled; torch_npu owns the capture window.
+  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"warmup_iterations\":1,\"active_iterations\":${PROFILER_MAX_ITERATIONS},\"max_iterations\":0}"
 
   echo "  PROFILER_CONFIG                     = ${PROFILER_CONFIG}"
 

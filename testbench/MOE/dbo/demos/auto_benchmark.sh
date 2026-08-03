@@ -38,10 +38,11 @@ set -euo pipefail
 
 # ── 路径 ───────────────────────────────────────────────────────────────────
 DEMOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_BASELINE="${DEMOS_DIR}/deepseek-v2-server.sh"
-SERVER_DBO="${DEMOS_DIR}/deepseek-v2-dbo-server.sh"
-SERVER_DP="${DEMOS_DIR}/deepseek-v2-dbo-server-dp.sh"
-TEST_SCRIPT="${DEMOS_DIR}/deepseek-v2-dbo-test.sh"
+DEEPSEEK_DIR="${DEMOS_DIR}/DeepseekV2"
+SERVER_BASELINE="${DEEPSEEK_DIR}/deepseek-v2-server.sh"
+SERVER_DBO="${DEEPSEEK_DIR}/deepseek-v2-dbo-server.sh"
+SERVER_DP="${DEEPSEEK_DIR}/deepseek-v2-dbo-server-dp.sh"
+TEST_SCRIPT="${DEEPSEEK_DIR}/deepseek-v2-dbo-test.sh"
 QWEN_DIR="${DEMOS_DIR}/Qwen3-30B"
 QWEN_SERVER_BASELINE="${QWEN_DIR}/Qwen3-30B-server.sh"
 QWEN_SERVER_DBO="${QWEN_DIR}/Qwen3-30B-dbo-server.sh"

@@ -11,10 +11,11 @@ DBO（Dual Batch Overlap）把一个大 batch 拆成两个 microbatch，让通�
 | 文件 | 作用 |
 |---|---|
 | `deepseek-v2-dbo-server.sh` | 启动开启 DBO 的 vllm server（默认端口 8001） |
+| `deepseek-v2-dbo-server-dp.sh` | 启动 DP=2、TP=1 的 DBO server |
 | `deepseek-v2-server.sh` | 启动关闭 DBO 的 baseline server（默认端口 8000） |
 | `deepseek-v2-dbo-test.sh` | 发压 + 对比 + profiler 采集 |
-| `bench.sh` | **一键对标**：顺序跑 baseline 和 DBO，输出 speedup 对比 |
-| `deepseek-v2-offline-dbo.py` | offline 模式验证 DBO 是否触发（不适合看性能） |
+| `e2e.sh` | **一键对标**：baseline vs FlashComm1 + DBO（TP=2） |
+| `e2e_dp.sh` | **一键对标**：DP baseline vs DBO（DP=2、TP=1） |
 
 ---
 
@@ -22,13 +23,24 @@ DBO（Dual Batch Overlap）把一个大 batch 拆成两个 microbatch，让通�
 
 ```bash
 # 只需一个命令，脚本会引导你依次启动两个 server
-bash bench.sh
+cd testbench/MOE/dbo/demos/DeepseekV2
+bash e2e.sh
 ```
 
 脚本流程：
-1. 提示你启动 baseline server → 等就绪 → 自动发压
-2. 提示你重启为 DBO server → 等就绪 → 自动发压
-3. 打印 speedup 对比表
+1. 自动启动 baseline（FlashComm1=0、DBO=0）并发压
+2. 自动重启为 FlashComm1 + DBO（FlashComm1=1、DBO=1）并发压
+3. 检查 DBO 触发日志并打印 speedup 对比表
+
+DP 端到端测试：
+
+```bash
+cd testbench/MOE/dbo/demos/DeepseekV2
+bash e2e_dp.sh
+```
+
+DP 脚本固定 TP=1、DP=2。由于 TP=1 不支持 FlashComm，DP 对比只切换
+`DBO_ENABLED=0/1`。
 
 ---
 

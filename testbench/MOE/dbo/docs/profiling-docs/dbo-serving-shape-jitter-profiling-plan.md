@@ -70,8 +70,8 @@ vllm_ascend/worker/worker.py:492]
 
 `deepseek-v2-dbo-test.sh` 默认在正式 benchmark 前发送 16 个 warmup 请求，并使用
 与正式 benchmark 相同的 input/output shape。[VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh:83] [VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh:173]
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh:83] [VERIFY:
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh:173]
 
 因此，正式 benchmark 的 TTFT/TPOT 不能直接回答“第一个 shape 是否抖动”。起始
 抖动实验必须令 `WARMUP_PROMPTS=0`，或使用不会覆盖目标 shape 的独立 warmup。
@@ -185,8 +185,8 @@ per-token 归一化延迟。
 
 DBO server 默认使用 TP=2、EP、prefill threshold 1024，并将 decode threshold
 设为极大值以关闭 decode DBO。[VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:80] [VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:96]
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:80] [VERIFY:
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:96]
 
 这样首先隔离 prefill DBO。不要在第一轮同时打开 decode DBO。
 
@@ -195,7 +195,7 @@ testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:96]
 复用 `deepseek-v2-dbo-test.sh` 的 `vllm bench serve` 参数和结果格式。该脚本已支持
 固定 random input length、固定 output length、并发、request rate、request-level
 detailed records 和 profiler API。[VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh:136]
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh:136]
 
 但需要增加一个专用 shape-sequence driver，按确定顺序发送 workload，而不是只输出
 整轮聚合值。建议新增：
@@ -522,8 +522,8 @@ HTTP ready
 ```
 
 利用 server 脚本已有 profiler配置采集 stack、shape和 memory。[VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:108] [VERIFY:
-testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:173]
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:108] [VERIFY:
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:173]
 
 timeline重点检查：
 

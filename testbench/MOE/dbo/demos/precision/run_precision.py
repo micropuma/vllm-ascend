@@ -156,7 +156,8 @@ def start_server(mode: str, demo_root: Path, environment_script: Path,
 
     Args:
         mode: ``baseline`` or ``dbo``.
-        demo_root: Directory containing both server scripts.
+        demo_root: Directory containing the DeepSeek server scripts and
+            precision tools.
         environment_script: Environment setup shell script for vLLM Ascend.
         port: Local API port.
         environment: Prepared environment for the child process.
@@ -166,6 +167,7 @@ def start_server(mode: str, demo_root: Path, environment_script: Path,
         A process owner that must be stopped by the caller.
     """
     script_name = "deepseek-v2-server.sh" if mode == "baseline" else "deepseek-v2-dbo-server.sh"
+    server_script = demo_root / "DeepseekV2" / script_name
     log_path = run_dir / f"{mode}_server_live.log"
     log_file = log_path.open("wb")
     child_environment = environment.copy()
@@ -183,7 +185,7 @@ def start_server(mode: str, demo_root: Path, environment_script: Path,
         "source \"$1\"; shift; export NO_PROXY=127.0.0.1,localhost; "
         "export no_proxy=127.0.0.1,localhost; exec env \"$@\"",
         "precision-server", str(environment_script), *assignments,
-        "bash", str(demo_root / script_name),
+        "bash", str(server_script),
     ]
     process = subprocess.Popen(
         command,

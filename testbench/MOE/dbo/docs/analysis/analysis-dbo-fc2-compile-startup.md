@@ -362,8 +362,8 @@ MoE backend deepep_low_latency
 ```
 
 服务脚本明确设置 TP=2、EP、DBO、prefill/decode threshold 和
-`deepep_low_latency`。[VERIFY: testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:60]
-[VERIFY: testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:178]
+`deepep_low_latency`。[VERIFY: testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:60]
+[VERIFY: testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:178]
 ubatch 数在插件侧仍硬编码默认为 2。[VERIFY: vllm_ascend/worker/ubatching.py:15]
 
 因此本文中“稳定”只应写成：
@@ -449,7 +449,7 @@ TP=2
 
 此建议严格绑定上述 DeepSeek-V2-Lite/A2/TP2 条件，不是全局默认值。
 脚本当前默认 `HCCL_OP_EXPANSION_MODE=AI_CPU`，与 FC2 的保守建议不一致；
-如果 FC2 开启，应显式覆盖为 AIV 并记录日志。[VERIFY: testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh:60]
+如果 FC2 开启，应显式覆盖为 AIV 并记录日志。[VERIFY: testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh:60]
 
 ---
 

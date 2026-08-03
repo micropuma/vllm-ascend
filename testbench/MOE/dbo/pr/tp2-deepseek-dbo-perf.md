@@ -58,14 +58,14 @@ HCCL_OP_EXPANSION_MODE=AI_CPU VLLM_ASCEND_ENABLE_FLASHCOMM1=1 \
 VLLM_ASCEND_ENABLE_DBO=1 VLLM_LOGGING_LEVEL=DEBUG PORT=8001 \
 LABEL=fc1_dbo_20_operator PROFILE_ROOT=/data/tmp/dbo-perf-fc1-dbo-20260730/fixed/profile \
 TORCH_PROFILER_DIR=/data/tmp/dbo-perf-fc1-dbo-20260730/fixed/profile/fc1_dbo_20_operator \
-bash testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh
+bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh
 
 LABEL=fc1_dbo_20_operator PORT=8001 BENCH_PRESET=prefill4k \
 INPUT_LEN=4096 OUTPUT_LEN=16 NUM_PROMPTS=500 MAX_CONCURRENCY=96 \
 PROFILE_ROOT=/data/tmp/dbo-perf-fc1-dbo-20260730/fixed/profile \
 TORCH_PROFILER_DIR=/data/tmp/dbo-perf-fc1-dbo-20260730/fixed/profile/fc1_dbo_20_operator \
 OUT_DIR=/data/tmp/dbo-perf-fc1-dbo-20260730/fixed/results RESULT_SUFFIX=_20step \
-bash testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh --profile
+bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh --profile
 ```
 
 ## Artifacts and capture integrity

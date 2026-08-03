@@ -156,24 +156,24 @@ baseline and `ADDITIONAL_CONFIG` forwarding.
 # Plain shared-expert A/B; repeat each side three times and alternate order.
 ENFORCE_EAGER=1 VLLM_ASCEND_ENABLE_DBO=1 \
   ADDITIONAL_CONFIG='{"multistream_overlap_shared_expert":true}' PORT=8001 \
-  bash testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh
+  bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh
 
 LABEL=tp2_fc1_dbo1_shared_stream PORT=8001 BENCH_PRESET=prefill4k \
   INPUT_LEN=4096 OUTPUT_LEN=16 NUM_PROMPTS=500 MAX_CONCURRENCY=96 \
   OUT_DIR=/data/tmp/dbo-perf-tp2-20260731/results \
-  bash testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh
+  bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh
 
 # Diagnostic only: never use profiler latency as serving data.
 ENABLE_PROFILER=1 PROFILER_MODE=operator PROFILER_MAX_ITERATIONS=8 \
   ENFORCE_EAGER=1 VLLM_ASCEND_ENABLE_DBO=1 PORT=8001 \
   TORCH_PROFILER_DIR=/data/tmp/dbo-perf-tp2-20260731/profile/candidate \
-  bash testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh
+  bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh
 
 # Exact quality gate; both ranks must log should_ubatch: True.
 ENFORCE_EAGER=1 PORT=8018 \
   python3 testbench/MOE/dbo/demos/precision/quick/run_quick_precision.py \
   --flashcomm1 1 \
-  --server-script "$PWD/testbench/MOE/dbo/demos/deepseek-v2-dbo-server.sh" \
+  --server-script "$PWD/testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server.sh" \
   --out-dir /data/tmp/dbo-perf-tp2-20260731/precision-candidate
 ```
 

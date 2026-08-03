@@ -19,10 +19,29 @@ TP=${TP:-2}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+ENFORCE_EAGER=${ENFORCE_EAGER:-0}
+ENABLE_PROFILER=${ENABLE_PROFILER:-0}
+PROFILE_ROOT=${PROFILE_ROOT:-/data/workspace/vllm-dbo-v0221/vllm-ascend/testbench/MOE/dbo/demos/profile}
+TORCH_PROFILER_DIR=${TORCH_PROFILER_DIR:-${PROFILE_ROOT}/qwen3_baseline_profile}
+PROFILER_MAX_ITERATIONS=${PROFILER_MAX_ITERATIONS:-20}
+PROFILER_WITH_STACK=${PROFILER_WITH_STACK:-false}
+PROFILER_RECORD_SHAPES=${PROFILER_RECORD_SHAPES:-true}
 
 echo "Starting Qwen3-30B baseline: model=$MODEL port=$PORT tp=$TP"
-exec vllm serve "$MODEL" \
-  --host "$HOST" --port "$PORT" --dtype bfloat16 --generation-config vllm \
-  --distributed-executor-backend mp --tensor-parallel-size "$TP" --enable-expert-parallel \
-  --max-model-len "$MAX_MODEL_LEN" --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+serve_args=(
+  serve "$MODEL" --host "$HOST" --port "$PORT" --dtype bfloat16 --generation-config vllm
+  --distributed-executor-backend mp --tensor-parallel-size "$TP" --enable-expert-parallel
+  --max-model-len "$MAX_MODEL_LEN" --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
   --max-num-seqs "$MAX_NUM_SEQS" --disable-log-stats
+)
+if [[ "$ENFORCE_EAGER" == "1" ]]; then
+  serve_args+=(--enforce-eager)
+fi
+if [[ "$ENABLE_PROFILER" == "1" ]]; then
+  export VLLM_RPC_TIMEOUT=${VLLM_RPC_TIMEOUT:-1800000}
+  mkdir -p "$TORCH_PROFILER_DIR"
+  profiler_config="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"warmup_iterations\":1,\"active_iterations\":${PROFILER_MAX_ITERATIONS},\"max_iterations\":0}"
+  echo "Profiler enabled: dir=$TORCH_PROFILER_DIR max_iterations=$PROFILER_MAX_ITERATIONS"
+  serve_args+=(--profiler-config "$profiler_config")
+fi
+exec vllm "${serve_args[@]}"

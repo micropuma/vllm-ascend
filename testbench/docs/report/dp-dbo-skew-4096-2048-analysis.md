@@ -22,7 +22,7 @@ Hardware/model/configuration used for the measurements:
   prefix-cache block hashes while preserving the exact prompt lengths.
 
 The request driver is
-`testbench/MOE/dbo/demos/deepseek-v2-dbo-dp-skew-test.py` and routes through
+`testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-dp-skew-test.py` and routes through
 `X-data-parallel-rank`.
 
 ## Reproduce the plain A/B
@@ -38,14 +38,14 @@ source /data/workspace/vllm-dbo-v0221/.venv-dbo/bin/activate
 
 # Terminal A: DBO-on server.
 DBO_ENABLED=1 ENFORCE_EAGER=1 VLLM_LOGGING_LEVEL=INFO \
-  bash testbench/MOE/dbo/demos/deepseek-v2-dbo-server-dp.sh
+  bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server-dp.sh
 
 # Terminal B: wait for readiness, warm up, then measure three independent runs.
 until curl -sf http://127.0.0.1:8001/v1/models >/dev/null; do sleep 2; done
-python testbench/MOE/dbo/demos/deepseek-v2-dbo-dp-skew-test.py \
+python testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-dp-skew-test.py \
   --repeats 3 --token-offset 0
 for run in 0 1 2; do
-  python testbench/MOE/dbo/demos/deepseek-v2-dbo-dp-skew-test.py \
+  python testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-dp-skew-test.py \
     --repeats 15 --token-offset "$((1000 + run * 100))"
 done
 ```
@@ -76,11 +76,11 @@ mkdir -p "$ARTIFACT_ROOT"
 ENABLE_PROFILER=1 PROFILER_MODE=operator PROFILER_MAX_ITERATIONS=20 \
 ENFORCE_EAGER=1 VLLM_LOGGING_LEVEL=DEBUG TORCH_PROFILER_DIR="$ARTIFACT_ROOT" \
 LABEL=skew_4096_2048 \
-  bash testbench/MOE/dbo/demos/deepseek-v2-dbo-server-dp.sh
+  bash testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server-dp.sh
 
 # Terminal B, after readiness
 until curl -sf http://127.0.0.1:8001/v1/models >/dev/null; do sleep 2; done
-python testbench/MOE/dbo/demos/deepseek-v2-dbo-dp-skew-test.py \
+python testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-dp-skew-test.py \
   --profile --repeats 8 --output-tokens 1 --token-offset 1000
 
 # After stop_profile returns, analyse each rank directory.

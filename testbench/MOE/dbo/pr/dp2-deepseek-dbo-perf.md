@@ -7,7 +7,7 @@ DeepSeek-V2-Lite-Chat on two Ascend 910B3 cards with `TP=1`, `DP=2`, `EP=2`,
 precision gate are:
 
 ```text
-testbench/MOE/dbo/demos/deepseek-v2-dbo-server-dp.sh
+testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-server-dp.sh
 testbench/MOE/dbo/demos/precision/quick/test_dbo_dp_precision.sh
 ```
 

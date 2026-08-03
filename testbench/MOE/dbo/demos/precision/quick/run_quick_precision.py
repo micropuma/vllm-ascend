@@ -147,7 +147,9 @@ def server_environment(mode: str, args: argparse.Namespace) -> dict[str, str]:
 
 def start_server(mode: str, demos_dir: Path, out_dir: Path, args: argparse.Namespace) -> tuple[subprocess.Popen[bytes], Path]:
     script = args.server_script or Path(
-        "deepseek-v2-dbo-server.sh" if mode == "dbo" else "deepseek-v2-server.sh"
+        "DeepseekV2/deepseek-v2-dbo-server.sh"
+        if mode == "dbo"
+        else "DeepseekV2/deepseek-v2-server.sh"
     )
     if not script.is_absolute():
         script = demos_dir / script

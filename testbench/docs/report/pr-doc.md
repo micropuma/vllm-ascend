@@ -72,8 +72,8 @@
 | 脚本 | 功能 |
 |---|---|
 | `testbench/MOE/dbo/demos/auto_benchmark.sh` | 全自动 10 组配置矩阵 benchmark |
-| `testbench/MOE/dbo/demos/bench.sh` | 单次 A/B 对比 benchmark |
-| `testbench/MOE/dbo/demos/deepseek-v2-dbo-test.sh` | DBO 客户端压测脚本 |
+| `testbench/MOE/dbo/demos/DeepseekV2/e2e.sh` | 单次 A/B 对比 benchmark |
+| `testbench/MOE/dbo/demos/DeepseekV2/deepseek-v2-dbo-test.sh` | DBO 客户端压测脚本 |
 
 ---
 
