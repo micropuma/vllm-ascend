@@ -488,6 +488,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
+        forward_context = get_forward_context()
         self.enable_shared_expert_dp = enable_shared_expert_dp
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
@@ -498,9 +499,16 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
 
+            # overlap DP all-gather with previous layer's MLA post.
+            if forward_context.dbo_enabled:
+                torch.ops.vllm.dbo_moe_prepare_hook(hidden_states, is_record=True)
+
             # All-gather across DP group
             hidden_states = self.moe_config.dp_group.all_gather(hidden_states, 0)
             router_logits = self.moe_config.dp_group.all_gather(router_logits, 0)
+
+            if forward_context.dbo_enabled:
+                torch.ops.vllm.dbo_moe_prepare_hook(hidden_states, is_record=False)
 
         if self.moe_config.pcp_size > 1:
             max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
@@ -616,8 +624,15 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
         if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
+            forward_context = get_forward_context()
+            if forward_context.dbo_enabled:
+                torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=True)
+
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
+
+            if forward_context.dbo_enabled:
+                torch.ops.vllm.dbo_moe_finalize_hook(hidden_states, is_record=False)
 
         if self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
