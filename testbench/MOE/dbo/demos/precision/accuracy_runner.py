@@ -213,6 +213,9 @@ async def request_one(client: httpx.AsyncClient, endpoint: str, model: str,
         "top_p": generation["top_p"],
         "seed": request_seed,
     }
+    chat_template_kwargs = generation.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict):
+        payload["chat_template_kwargs"] = chat_template_kwargs
     if include_logprobs:
         payload["logprobs"] = True
         payload["top_logprobs"] = top_logprobs

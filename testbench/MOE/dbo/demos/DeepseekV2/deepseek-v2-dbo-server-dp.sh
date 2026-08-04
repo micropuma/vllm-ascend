@@ -259,7 +259,7 @@ if [[ "$ENABLE_PROFILER" == "1" ]]; then
 
   # Disable the unbounded AsyncLLM frontend trace and use the same bounded
   # torch_npu schedule as the TP DBO server.
-  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_memory\":true,\"torch_profiler_with_flops\":false,\"ignore_frontend\":true,\"warmup_iterations\":1,\"active_iterations\":${PROFILER_MAX_ITERATIONS},\"max_iterations\":0}"
+  PROFILER_CONFIG="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${TORCH_PROFILER_DIR}\",\"torch_profiler_with_memory\":true,\"torch_profiler_record_shapes\":${PROFILER_RECORD_SHAPES},\"torch_profiler_with_stack\":${PROFILER_WITH_STACK},\"torch_profiler_use_gzip\":true,\"torch_profiler_with_flops\":false,\"max_iterations\":${PROFILER_MAX_ITERATIONS}}"
 
   echo "  PROFILER_CONFIG                     = ${PROFILER_CONFIG}"
 

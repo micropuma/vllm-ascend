@@ -28,12 +28,26 @@ from init_run import create_run
 
 
 DEFAULT_MODEL: Final[str] = "/data/models/DeepSeek-V2-Lite-Chat"
+DEFAULT_QWEN3_MODEL: Final[str] = "/data/models/Qwen3-30B/Qwen3-30B"
 DEFAULT_ENDPOINT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8001
 DEFAULT_READY_TIMEOUT_S: Final[float] = 1_800.0
 DEFAULT_REQUEST_TIMEOUT_S: Final[float] = 600.0
 DEFAULT_ACCURACY_DROP: Final[float] = 0.005
 DEFAULT_CONCURRENCY: Final[int] = 64
+
+FAMILY_SERVER_DIR: Final[dict[str, str]] = {
+    "deepseek": "DeepseekV2",
+    "qwen3": "Qwen3-30B",
+}
+FAMILY_SCRIPTS: Final[dict[str, dict[str, str]]] = {
+    "deepseek": {"baseline": "deepseek-v2-server.sh", "dbo": "deepseek-v2-dbo-server.sh"},
+    "qwen3": {"baseline": "Qwen3-30B-server.sh", "dbo": "Qwen3-30B-dbo-server.sh"},
+}
+FAMILY_DEFAULT_MODELS: Final[dict[str, str]] = {
+    "deepseek": DEFAULT_MODEL,
+    "qwen3": DEFAULT_QWEN3_MODEL,
+}
 
 
 @dataclass(frozen=True)
@@ -85,7 +99,13 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="Dataset to run; default evaluates both local datasets.",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model-family",
+        choices=("deepseek", "qwen3"),
+        default="deepseek",
+        help="Model family selects server scripts and default model path.",
+    )
+    parser.add_argument("--model", help="Override the default model path for this family.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--limit", type=int, help="Limit each dataset for a smoke run.")
@@ -150,13 +170,18 @@ def build_environment(mode: str, cache_root: Path | None) -> dict[str, str]:
     return environment
 
 
-def start_server(mode: str, demo_root: Path, environment_script: Path,
-                 port: int, environment: dict[str, str], run_dir: Path) -> ManagedServer:
+def start_server(mode: str, model_family: str, model_path: str, demo_root: Path,
+                 environment_script: Path, port: int, environment: dict[str, str],
+                 run_dir: Path) -> ManagedServer:
     """Start a server script and redirect all output to a run-local log.
 
     Args:
         mode: ``baseline`` or ``dbo``.
-        demo_root: Directory containing the DeepSeek server scripts and
+        model_family: ``deepseek`` or ``qwen3`` — selects the server script
+            directory and filename.
+        model_path: Absolute path to the model checkpoint passed as ``MODEL``
+            to the server script.
+        demo_root: Directory containing the model-family server scripts and
             precision tools.
         environment_script: Environment setup shell script for vLLM Ascend.
         port: Local API port.
@@ -166,14 +191,16 @@ def start_server(mode: str, demo_root: Path, environment_script: Path,
     Returns:
         A process owner that must be stopped by the caller.
     """
-    script_name = "deepseek-v2-server.sh" if mode == "baseline" else "deepseek-v2-dbo-server.sh"
-    server_script = demo_root / "DeepseekV2" / script_name
+    family_dir = FAMILY_SERVER_DIR[model_family]
+    script_name = FAMILY_SCRIPTS[model_family][mode]
+    server_script = demo_root / family_dir / script_name
     log_path = run_dir / f"{mode}_server_live.log"
     log_file = log_path.open("wb")
     child_environment = environment.copy()
     child_environment["PORT"] = str(port)
+    child_environment["MODEL"] = model_path
     controlled_keys = (
-        "PORT", "VLLM_ASCEND_ENABLE_FLASHCOMM1", "VLLM_ASCEND_ENABLE_DBO",
+        "PORT", "MODEL", "VLLM_ASCEND_ENABLE_FLASHCOMM1", "VLLM_ASCEND_ENABLE_DBO",
         "VLLM_LOGGING_LEVEL", "XDG_CACHE_HOME", "TORCHINDUCTOR_CACHE_DIR",
         "VLLM_COMPILE_CACHE_PATH",
     )
@@ -329,6 +356,8 @@ def compare_tasks(tasks: Sequence[Task], args: argparse.Namespace,
 def main() -> int:
     """Execute the baseline-to-DBO precision validation transaction."""
     args = parse_args()
+    if args.model is None:
+        args.model = FAMILY_DEFAULT_MODELS[args.model_family]
     os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     os.environ["no_proxy"] = "127.0.0.1,localhost"
     demo_root = Path(__file__).resolve().parent.parent
@@ -346,8 +375,8 @@ def main() -> int:
     write_orchestrator_metadata(run_dir, args, cache_root)
 
     baseline = start_server(
-        "baseline", demo_root, environment_script, args.port,
-        build_environment("baseline", None), run_dir)
+        "baseline", args.model_family, args.model, demo_root, environment_script,
+        args.port, build_environment("baseline", None), run_dir)
     try:
         wait_for_server(endpoint, baseline.process, args.ready_timeout)
         evaluate_tasks(tasks, "baseline", args, demo_root, run_dir, endpoint)
@@ -356,8 +385,8 @@ def main() -> int:
     archive_server_facts("baseline", baseline.log_path, run_dir, demo_root)
 
     dbo = start_server(
-        "dbo", demo_root, environment_script, args.port,
-        build_environment("dbo", cache_root), run_dir)
+        "dbo", args.model_family, args.model, demo_root, environment_script,
+        args.port, build_environment("dbo", cache_root), run_dir)
     try:
         wait_for_server(endpoint, dbo.process, args.ready_timeout)
         evaluate_tasks(tasks, "dbo", args, demo_root, run_dir, endpoint)

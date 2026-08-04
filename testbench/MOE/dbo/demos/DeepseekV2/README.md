@@ -1,121 +1,59 @@
-# DeepSeek-V2 DBO 测试套件
+# DeepSeek-V2 DBO 性能测试
 
-DBO（Dual Batch Overlap）把一个大 batch 拆成两个 microbatch，让通信（AllGather/AllToAll）和计算（Attention/MoE 矩阵乘）在 NPU 上真正并发，从而隐藏通信延迟。
+DBO（Dual Batch Overlap）把大 batch 拆成两个 microbatch，让通信和计算在 NPU 上并发执行，隐藏通信延迟。
 
-**DBO 只在 server 高并发模式下有意义**，offline `llm.generate()` 的 batch 太小，overhead 反而更大。
+所有性能对比统一通过 `auto_benchmark.sh` 完成。
 
----
-
-## 文件说明
-
-| 文件 | 作用 |
-|---|---|
-| `deepseek-v2-dbo-server.sh` | 启动开启 DBO 的 vllm server（默认端口 8001） |
-| `deepseek-v2-dbo-server-dp.sh` | 启动 DP=2、TP=1 的 DBO server |
-| `deepseek-v2-server.sh` | 启动关闭 DBO 的 baseline server（默认端口 8000） |
-| `deepseek-v2-dbo-test.sh` | 发压 + 对比 + profiler 采集 |
-| `e2e.sh` | **一键对标**：baseline vs FlashComm1 + DBO（TP=2） |
-| `e2e_dp.sh` | **一键对标**：DP baseline vs DBO（DP=2、TP=1） |
-
----
-
-## 快速开始：一键对标
+## 快速实验
 
 ```bash
-# 只需一个命令，脚本会引导你依次启动两个 server
-cd testbench/MOE/dbo/demos/DeepseekV2
-bash e2e.sh
+cd /data/workspace/vllm-dbo-v0221/vllm-ascend/testbench/MOE/dbo/demos
+source /data/workspace/vllm-dbo-v0221/.venv-dbo/bin/activate
+source /data/workspace/vllm-dbo-v0221/env.sh
+
+# DP 快速对比: dp_baseline vs dp_dbo
+TEST_GROUPS=p0_deepseek_dp bash auto_benchmark.sh
+
+# TP 快速对比: baseline vs fc1 vs dbo vs dbo_fc1
+TEST_GROUPS=p0_deepseek_tp CONFIGS=baseline,fc1,dbo,dbo_fc1 bash auto_benchmark.sh
+
+# TP 全矩阵
+TEST_GROUPS=p0_deepseek_tp bash auto_benchmark.sh
 ```
 
-脚本流程：
-1. 自动启动 baseline（FlashComm1=0、DBO=0）并发压
-2. 自动重启为 FlashComm1 + DBO（FlashComm1=1、DBO=1）并发压
-3. 检查 DBO 触发日志并打印 speedup 对比表
-
-DP 端到端测试：
+自定义模型：
 
 ```bash
-cd testbench/MOE/dbo/demos/DeepseekV2
-bash e2e_dp.sh
+MODEL=/path/to/DeepSeek-V2-Lite-Chat TEST_GROUPS=p0_deepseek_tp bash auto_benchmark.sh
 ```
 
-DP 脚本固定 TP=1、DP=2。由于 TP=1 不支持 FlashComm，DP 对比只切换
-`DBO_ENABLED=0/1`。
-
----
-
-## 手动分步运行
-
-### 1. 启动 server
+## 手动分步（调试用）
 
 ```bash
-# 终端 1 — baseline（端口 8000）
-PORT=8000 bash deepseek-v2-server.sh
+# 终端 1 — 启动 server
+PORT=8001 bash deepseek-v2-server.sh           # baseline
+PORT=8001 bash deepseek-v2-dbo-server.sh       # DBO
+PORT=8001 bash deepseek-v2-dbo-server-dp.sh    # DP
 
-# 终端 1 — 或 DBO（端口 8001）
-PORT=8001 bash deepseek-v2-dbo-server.sh
-```
-
-### 2. 发压
-
-```bash
-# 对 baseline 发压
-LABEL=baseline PORT=8000 bash deepseek-v2-dbo-test.sh
-
-# 对 DBO 发压
+# 终端 2 — 发压
+LABEL=baseline PORT=8001 bash deepseek-v2-dbo-test.sh
 LABEL=dbo PORT=8001 bash deepseek-v2-dbo-test.sh
 
 # 打印对比
 bash deepseek-v2-dbo-test.sh --compare
 ```
 
-### 3. 采集 Profiler
-
-server 启动时加 `ENABLE_PROFILER=1`，然后发压时用 `--profile` 模式：
-
-```bash
-# 终端 1 — 启动带 profiler 的 DBO server
-ENABLE_PROFILER=1 PORT=8001 bash deepseek-v2-dbo-server.sh
-
-# 终端 2 — 发压并自动 start/stop profiler
-LABEL=dbo PORT=8001 bash deepseek-v2-dbo-test.sh --profile
-```
-
-profiler 数据落到 `/data/workspace/vllm-ascend/profile/dbo_profile/`，用 Tensorboard 打开：
-
-```bash
-tensorboard --logdir /data/workspace/vllm-ascend/profile/dbo_profile/
-```
-
----
-
 ## 关键参数
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `MODEL` | `/data/models/DeepSeek-V2-Lite-Chat` | 模型路径 |
-| `INPUT_LEN` | `1024` | prompt token 数，**需 ≥ 512** 才触发 DBO prefill 阈值 |
-| `OUTPUT_LEN` | `128` | 生成 token 数 |
-| `NUM_PROMPTS` | `200` | 总请求数 |
-| `MAX_CONCURRENCY` | `64` | 并发数，越大 batch 越大，DBO 收益越明显 |
-| `ENABLE_PROFILER` | `0` | server 启动时设为 `1` 开启 torch_npu profiler |
+| `PORT` | `8001` | 服务端口 |
+| `TP` | `2` | 张量并行度 |
+| `DBO_PREFILL_TOKEN_THRESHOLD` | `1024` | DBO prefill 触发阈值 |
 
----
+## 环境
 
-## DBO 触发条件
-
-同时满足以下 4 个条件时，每次 forward 会启用 DBO：
-
-1. server 启动时传了 `--enable-dbo`
-2. 当前 step 的 batch token 数 ≥ `dbo_prefill_token_threshold`（默认 512）
-3. MoE 通信模式不为 MC2（TP=2/EP=2 小规模下自动满足）
-4. padding 后第二个 microbatch 非空
-
-**验证是否触发**：在 server 日志里搜索 `should_ubatch: True`
-
----
-
-## 环境要求
-
-- 2 张 Ascend NPU（TP=2）
-- `HCCL_OP_EXPANSION_MODE=AI_CPU`（已在 server 脚本中设置，让通信跑在 AI_CPU 核上，是 DBO 并发生效的硬件前提）
+- 2 张 Ascend NPU
+- `HCCL_OP_EXPANSION_MODE=AI_CPU`
+- 详见 `../README.md`

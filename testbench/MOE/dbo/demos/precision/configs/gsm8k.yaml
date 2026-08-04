@@ -10,6 +10,8 @@ generation:
   temperature: 0.0
   top_p: 1.0
   seed: 42
+  chat_template_kwargs:
+    enable_thinking: false
 system_prompt: >-
   Solve each math problem carefully. End the response with the exact final
   answer in the form "#### <number>".

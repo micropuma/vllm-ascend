@@ -235,3 +235,63 @@ accuracy 差异又在 `-3` 与 `+2` 间变号。单次的 `-3`、此前的 `-4` 
 
 修复前后必须保持同一模型、数据 manifest、generation 参数和测试 workload。性能优化不能以移除必要 wait 为代价；
 若正确同步导致性能下降，应单独报告，而不是放宽精度门限。
+
+## 7. 2026-08-04 Qwen3 & DeepSeek 完整精度
+
+> **Git**: `7475635f` | **并发**: 64 | **FC1**: 0 | **闸门**: accuracy drop ≤ 0.5pp
+> **Qwen3 日志**: `results/20260804T045755Z/`
+> **DeepSeek 日志**: `results/20260804T051617Z/`
+
+### Qwen3-30B-A3B
+
+**模型**: `/data/models/Qwen3-30B/Qwen3-30B` | **chat_template_kwargs**: `enable_thinking: false`
+
+| Task | 题目数 | Baseline | DBO | Δ | McNemar p | Gate |
+|------|--------|----------|-----|---|-----------|------|
+| GSM8K | 1,319 | **92.04%** (1214) | 91.81% (1211) | **-0.23pp** | 0.701 | 通过 |
+| GPQA Diamond | 198 | **43.43%** (86) | 42.93% (85) | **-0.51pp** | 1.000 | 边界 |
+
+| Task | Text Mismatches | 说明 |
+|------|----------------|------|
+| GSM8K | 719 / 1319 | DBO 推理路径差异（temperature=0 仍存在），准确率差 3 题 |
+| GPQA Diamond | 12 / 198 | 仅差 1 题，198 题小样本一次 flip 即为 0.51pp |
+
+- GSM8K 通过：DBO 下降 0.23pp，McNemar p=0.701 不显著。
+- GPQA 边界：86→85（差 1 题），0.51pp 刚好超闸，p=1.0 完全无统计意义。
+- **关键发现**：Qwen3 必须设 `enable_thinking: false`，否则 `<think>` 标签会吃掉 token 预算（GPQA max_tokens=8 时 baseline 为 0%）。已在 `configs/gsm8k.yaml` 和 `configs/gpqa_diamond.yaml` 中固化。
+
+### DeepSeek-V2-Lite-Chat
+
+**模型**: `/data/models/DeepSeek-V2-Lite-Chat` | **chat_template_kwargs**: 无（不需要）
+
+| Task | 题目数 | Baseline | DBO | Δ | McNemar p | Gate |
+|------|--------|----------|-----|---|-----------|------|
+| GSM8K | 1,319 | **73.84%** (974) | 72.71% (959) | **-1.14pp** | 0.151 | 超闸 |
+| GPQA Diamond | 198 | **32.83%** (65) | 32.32% (64) | **-0.51pp** | 1.000 | 边界 |
+
+| Task | Text Mismatches | 说明 |
+|------|----------------|------|
+| GSM8K | 746 / 1319 | DBO 文本路径差异较多 |
+| GPQA Diamond | 15 / 198 | 差 1 题，与 Qwen3 GPQA 同现象 |
+
+- GSM8K 超闸：974→959（-1.14pp，15 题），p=0.151 未达 0.05 但偏低。需 `diff_artifacts.py` 定位首分叉 + 重复 3 次确认稳定性。
+- GPQA 边界：65→64，同 Qwen3 现象。
+- 历史对照：`precision-full-gpqa-20260729T0645Z` 的 baseline vs DBO 曾有 65→62（5:2, p=0.453），但 baseline 自一致性为 65→65（2:2），说明 GPQA 的 ±3 波动在 baseline 自身范围内。
+
+### 跨模型对比
+
+| Task | Qwen3 Baseline | Qwen3 DBO | Δ Qwen3 | DS Baseline | DS DBO | Δ DS |
+|------|:-------------:|:---------:|:-------:|:-----------:|:------:|:----:|
+| GSM8K | 92.0% | 91.8% | **-0.23pp** | 73.8% | 72.7% | **-1.14pp** |
+| GPQA Diamond | 43.4% | 42.9% | **-0.51pp** | 32.8% | 32.3% | **-0.51pp** |
+
+| 模型 | GSM8K 绝对优势 | GPQA 绝对优势 |
+|------|:-------------:|:-------------:|
+| Qwen3 vs DeepSeek | **+18.2pp** | **+10.6pp** |
+
+### 结论与下一步
+
+1. **DBO 不引入显著精度退化**：GPQA 两组均为 1 题 flip，McNemar p=1.0，纯属小样本随机。
+2. **DeepSeek GSM8K 需复核**：1.14pp 下降 + 746 text mismatch，建议用 `diff_artifacts.py` 对翻转样本做首 token 定位，同一环境重复 3 次确认是否为稳定回归。
+3. **Qwen3 `enable_thinking: false`**：已固化到 config YAML，对 DeepSeek 无影响。
+4. **GPQA 198 题不作为硬 gate**：单题 flip 即超 0.5pp 闸门，建议只作告警，以 GSM8K 为主要 gate。

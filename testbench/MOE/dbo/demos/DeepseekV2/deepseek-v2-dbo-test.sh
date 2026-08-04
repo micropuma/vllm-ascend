@@ -214,15 +214,18 @@ run_bench() {
         # follow the historical ${label}_profile convention.
         local profiler_dir="$TORCH_PROFILER_DIR"
         local profile_runs=()
-        mapfile -t profile_runs < <(find "$profiler_dir" -maxdepth 1 -mindepth 1 \
+        mapfile -t profile_runs < <(find "$profiler_dir" -maxdepth 3 -mindepth 1 \
             -type d -name '*_ascend_pt' 2>/dev/null | sort)
         if (( ${#profile_runs[@]} > 0 )); then
             if python3 -c 'import torch_npu' 2>/dev/null; then
                 local profile_run
                 for profile_run in "${profile_runs[@]}"; do
                     local elapsed_seconds=0
-                    while ! find "$profile_run" -path '*/host/start_info.done' \
-                        -type f -print -quit | grep -q .; do
+                    # CANN 9 does not reliably create the legacy
+                    # host/start_info.done marker. profiler_info.end_info is
+                    # the worker flush boundary; wait for that instead.
+                    while ! find "$profile_run" -maxdepth 1 -name 'profiler_info_*.json' \
+                        -size +0c -print -quit | xargs -r jq -e '.end_info' >/dev/null 2>&1; do
                         if (( elapsed_seconds >= PROFILER_FLUSH_TIMEOUT_SECONDS )); then
                             echo "  ✗ Timed out waiting for CANN flush marker: $profile_run" >&2
                             return 1
@@ -230,18 +233,29 @@ run_bench() {
                         sleep "$PROFILER_FLUSH_POLL_SECONDS"
                         elapsed_seconds=$((elapsed_seconds + PROFILER_FLUSH_POLL_SECONDS))
                     done
-                    echo "  Running torch_npu analyse: $profile_run"
-                    PROFILE_RUN_DIR="$profile_run" python3 - <<'PYEOF'
+                    sleep "$PROFILER_FLUSH_POLL_SECONDS"
+                    output_dir="$profile_run/ASCEND_PROFILER_OUTPUT"
+                    if [[ -e "$output_dir/analyse.done" ]]; then
+                        echo "  analyse.done exists; reusing existing analysis: $profile_run"
+                    else
+                        echo "  Running torch_npu analyse: $profile_run"
+                        PROFILE_RUN_DIR="$profile_run" python3 - <<'PYEOF'
 import os
 from torch_npu.profiler.profiler import analyse
 analyse(os.environ["PROFILE_RUN_DIR"])
 print("analyse done. Open with TensorBoard / MindStudio:", os.environ["PROFILE_RUN_DIR"])
 PYEOF
-                    local output_dir="$profile_run/ASCEND_PROFILER_OUTPUT"
-                    if [[ ! -s "$output_dir/step_trace_time.csv" ]]; then
-                        echo "  ✗ Missing step_trace_time.csv: $output_dir" >&2
-                        return 1
                     fi
+                    required_artifacts=(trace_view.json step_trace_time.csv op_statistic.csv kernel_details.csv communication.json communication_matrix.json)
+                    for artifact in "${required_artifacts[@]}"; do
+                        if [[ ! -s "$output_dir/$artifact" ]]; then
+                            echo "  ✗ Missing $artifact: $output_dir" >&2
+                            if [[ -e "$output_dir/analyse.done" ]]; then
+                                echo "    Raw PROF_* data may already be consumed; recapture instead of re-running analyse()." >&2
+                            fi
+                            return 1
+                        fi
+                    done
                     if ! jq empty "$output_dir/trace_view.json" >/dev/null 2>&1; then
                         echo "  ✗ Invalid trace_view.json: $output_dir" >&2
                         return 1

@@ -1,83 +1,80 @@
-# DBO Offline Precision
+# DBO 精度测试框架
 
-`run_precision.py` is the daily entry point. It uses only `/data/datasets` and
-the local `127.0.0.1` vLLM service; it neither downloads a dataset nor uses an
-external inference API. A local HTTP service is intentional: DBO changes
-continuous batching and must be evaluated through the serving path.
+本目录提供通过本地 OpenAI-compatible 服务进行 baseline/DBO 配对精度验证的工具。测试只使用本地数据集和
+`127.0.0.1` 服务，不访问外部推理 endpoint。
 
-## One Command
-
-Activate the same editable environment used by the server, then run both
-datasets:
+## 环境
 
 ```bash
 source /data/workspace/vllm-dbo-v0221/.venv-dbo/bin/activate
+source /data/workspace/vllm-dbo-v0221/env.sh
 cd /data/workspace/vllm-dbo-v0221/vllm-ascend/testbench/MOE/dbo/demos/precision
-python run_precision.py
 ```
 
-For a quick smoke test before a full run:
+## 完整测试
+
+### DeepSeek-V2-Lite-Chat（默认）
 
 ```bash
 python run_precision.py --task gpqa_diamond --limit 64
+python run_precision.py --task all
 ```
 
-## Quick Regression Gate
+### Qwen3-30B-A3B
 
-Run this after a DBO performance change before starting a longer accuracy run:
+```bash
+python run_precision.py --model-family qwen3 --task all
+```
+
+自定义模型路径：
+
+```bash
+python run_precision.py --model-family qwen3 \
+    --model /data/models/Qwen3-30B/Qwen3-30B --task all
+```
+
+DeepSeek 自定义路径：
+
+```bash
+python run_precision.py --model /data/models/DeepSeek-V2-Lite-Chat --task all
+```
+
+DBO server 的 cold-start 可能较慢，可增加 `--ready-timeout 3600`。
+
+## Quick Gate
+
+快速门禁检查固定请求波次的生成 token 和输出 logprob：
 
 ```bash
 bash quick/test_dbo_precision.sh
 bash quick/test_dbo_fc1_precision.sh
 ```
 
-The quick gate uses a concurrent wave of 16 unique, tokenizer-verified 2K
-prefills. It requires `should_ubatch: True` from both TP ranks, requires every
-HTTP request and output-logprob response to succeed, and fails on a generated
-token difference or sampled-token logprob difference above `1e-3`. Its result
-artifacts are saved under `precision/results/quick-*`. It reuses the normal
-compile caches for turnaround time, so it is a correctness gate rather than a
-cold-start or performance measurement.
+完整 runner 会依次执行 baseline、停止服务、冷启动 DBO、检查所有 TP rank 的 `should_ubatch: True`，然后生成
+配对比较报告。默认允许 baseline 到 DBO 的准确率下降不超过 `0.5pp`。
 
-The runner forces `NO_PROXY`/`no_proxy` for local traffic and forces
-`VLLM_ASCEND_ENABLE_FLASHCOMM1=0` in both modes. It performs this sequence:
+## 结果
+
+每次运行写入 `results/<run-id>/`，主要文件包括：
 
 ```text
-baseline server -> evaluate -> stop
-new empty DBO cache -> DBO server -> evaluate -> verify TP0 and TP1 trigger -> stop
-paired accuracy reports
+manifest.json                 commit、editable import 和运行环境
+orchestrator.json             commit、模型路径和测试策略
+baseline_<task>.json          baseline 原始输出与 logprob
+dbo_<task>.json               DBO 原始输出与 logprob
+baseline_server_config.json   baseline 实际服务配置
+dbo_server_config.json        DBO 实际服务配置
+dbo_trigger.json              DBO 触发证据
+compare_<task>.json           配对比较结果
 ```
 
-The default accuracy gate permits at most a `0.5pp` baseline-to-DBO decline.
-Override it only with an explicit policy, for example
-`--max-accuracy-drop 0.0`. Text mismatches are retained for diagnosis rather
-than used as a gate because concurrent serving can have baseline self-variance.
+精度分叉时，先检查 server config 和 DBO trigger，再使用 `diff_artifacts.py` 定位第一个 token 分叉。精度测试
+不是性能测试，吞吐和延迟应使用 `testbench/MOE/dbo/demos/` 下的 benchmark 脚本测量。
 
-## Artifacts
-
-Every invocation writes `results/<run-id>/`:
-
-```text
-manifest.json                 checked-out commits and editable import paths
-orchestrator.json             exact runner policy and cold DBO cache root
-baseline_<task>.json          raw outputs, parsed answers, optional logprobs
-dbo_<task>.json               matching DBO results
-baseline_server_config.json   printed and runtime baseline facts
-dbo_server_config.json        printed and runtime DBO facts
-dbo_trigger.json              required DBO evidence from both TP ranks
-compare_<task>.json           paired transitions and McNemar p-value
-```
-
-Use `diff_artifacts.py` only to inspect a completed pair or repeated runs. Use
-`rescore_artifact.py` only after changing an answer parser; it does not rerun
-inference.
-
-## Development Checks
-
-The framework is Python-only, so no C++ kernel or binding is introduced here.
-Python code follows Google-style docstrings and type annotations. Run:
+## 开发检查
 
 ```bash
+cd testbench/MOE/dbo/demos/precision
 python -m pytest
 python -m mypy --config-file pyproject.toml .
 ```

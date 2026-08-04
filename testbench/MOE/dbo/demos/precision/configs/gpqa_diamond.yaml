@@ -9,6 +9,8 @@ generation:
   temperature: 0.0
   top_p: 1.0
   seed: 42
+  chat_template_kwargs:
+    enable_thinking: false
 system_prompt: >-
   Answer the multiple-choice question. Reply with only the single correct
   option letter: A, B, C, or D.

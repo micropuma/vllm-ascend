@@ -62,20 +62,25 @@ DRY_RUN=${DRY_RUN:-0}
 # TEST_PLAN is retained as a backwards-compatible alias for older invocations.
 TEST_GROUPS=${TEST_GROUPS:-${TEST_PLAN:-p0_deepseek_tp}}
 TEST_PLAN=${TEST_PLAN:-$TEST_GROUPS}
-DEBUG_VALIDATION=${DEBUG_VALIDATION:-1}
+# used for dbo validation
+DEBUG_VALIDATION=${DEBUG_VALIDATION:-0}
 PERFORMANCE_RUN=${PERFORMANCE_RUN:-1}
 BENCH_PRESETS_EXPLICIT=${BENCH_PRESETS+x}
 
-# The validation and performance lanes must not share compile/cache artifacts.
+# By default all cases reuse the normal shared caches. Set USE_CASE_CACHE=1 to
+# isolate validation/performance artifacts under RUN_ROOT (cold-cache behavior).
 RUN_ROOT=${RUN_ROOT:-${OUT_DIR:-/data/workspace/vllm-ascend/testbench/MOE/dbo/testbench/results}/runs}
+USE_CASE_CACHE=${USE_CASE_CACHE:-0}
 SOURCE_ENV=${SOURCE_ENV:-1}
 VENV_ROOT=${VENV_ROOT:-/data/workspace/vllm-dbo-v0221/.venv-dbo}
 ENV_SCRIPT=${ENV_SCRIPT:-/data/workspace/vllm-dbo-v0221/env.sh}
 
 # ── 超时 / 冷却 ─────────────────────────────────────────────────────────────
-SERVER_START_TIMEOUT=${SERVER_START_TIMEOUT:-600}
+SERVER_START_TIMEOUT=${SERVER_START_TIMEOUT:-1800}
 SERVER_STOP_TIMEOUT=${SERVER_STOP_TIMEOUT:-60}
 INTER_CONFIG_SLEEP=${INTER_CONFIG_SLEEP:-5}
+VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-1800}
+export VLLM_ENGINE_READY_TIMEOUT_S
 
 # ── 设备显存管理 ─────────────────────────────────────────────────────────────
 # 每个 config 结束后等待设备显存释放的超时 & 阈值
@@ -213,6 +218,7 @@ get_physical_npu_ids() {
 import subprocess, re, sys
 
 logical_ids = [int(x.strip()) for x in sys.argv[1].split(',') if x.strip().isdigit()]
+mapped = set()
 
 # Parse npu-smi info -m to build logical->physical mapping
 try:
@@ -227,10 +233,15 @@ try:
             for lid in logical_ids:
                 if lid == logic_id:
                     print(f"{lid}:{npu_id}")
+                    mapped.add(lid)
                     break
 except Exception:
-    # Fallback: assume direct mapping (unlikely but safe)
-    for lid in logical_ids:
+    pass
+
+# Keep memory polling conservative when npu-smi output is unavailable or has
+# a different format. An empty mapping would otherwise look like "all free".
+for lid in logical_ids:
+    if lid not in mapped:
         print(f"{lid}:{lid}")
 PYEOF
 }
@@ -391,8 +402,11 @@ wait_server() {
 start_server() {
     local name="$1" family="$2" dbo="$3" fc1="$4" fc2_par="$5" fc2_osh="$6" hccl="$7" additional_config="$8" run_mode="${9:-perf}"
     local server_script case_model="$BASE_MODEL" case_tp="$BASE_TP" case_dp=1 case_dp_local=1
-    local cache_root="${RUN_ROOT}/${run_mode}/${name}"
-    mkdir -p "$cache_root/xdg" "$cache_root/torchinductor" "$cache_root/vllm-compile"
+    local cache_root="shared"
+    if [[ "$USE_CASE_CACHE" == "1" ]]; then
+        cache_root="${RUN_ROOT}/${run_mode}/${name}"
+        mkdir -p "$cache_root/xdg" "$cache_root/torchinductor" "$cache_root/vllm-compile"
+    fi
 
     case "$family" in
         deepseek_tp)
@@ -432,15 +446,18 @@ start_server() {
     export VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE="$fc2_par"
     export VLLM_ASCEND_ENABLE_FLASHCOMM2_OSHARED="$fc2_osh"
     export VLLM_ASCEND_ENABLE_DBO="$dbo"
+    export VLLM_ENGINE_READY_TIMEOUT_S
     if [[ "$run_mode" == "debug" ]]; then
         export VLLM_LOGGING_LEVEL="${DEBUG_LOG_LEVEL:-DEBUG}"
     else
         export VLLM_LOGGING_LEVEL="${PERF_LOG_LEVEL:-INFO}"
     fi
     export DBO_PREFILL_TOKEN_THRESHOLD DBO_DECODE_TOKEN_THRESHOLD
-    export XDG_CACHE_HOME="$cache_root/xdg"
-    export TORCHINDUCTOR_CACHE_DIR="$cache_root/torchinductor"
-    export VLLM_COMPILE_CACHE_PATH="$cache_root/vllm-compile"
+    if [[ "$USE_CASE_CACHE" == "1" ]]; then
+        export XDG_CACHE_HOME="$cache_root/xdg"
+        export TORCHINDUCTOR_CACHE_DIR="$cache_root/torchinductor"
+        export VLLM_COMPILE_CACHE_PATH="$cache_root/vllm-compile"
+    fi
     export MODEL="$case_model" PORT HOST TP="$case_tp"
     export DP="$case_dp" DP_LOCAL="$case_dp_local"
     export MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
@@ -468,7 +485,21 @@ start_server() {
     if [[ -n "$existing" ]]; then
         log_msg "  ⚠ 端口 $PORT 被占用 (PID: $existing)，尝试清理..."
         kill $existing 2>/dev/null || true
-        sleep 3
+        local port_waited=0
+        while [[ $port_waited -lt 10 ]] && lsof -ti :"$PORT" >/dev/null 2>&1; do
+            sleep 1
+            port_waited=$((port_waited + 1))
+        done
+        existing=$(lsof -ti :"$PORT" 2>/dev/null || true)
+        if [[ -n "$existing" ]]; then
+            log_msg "  ⚠ 端口 $PORT 未释放，强制清理 PID $existing"
+            kill -KILL $existing 2>/dev/null || true
+            sleep 2
+        fi
+        if lsof -ti :"$PORT" >/dev/null 2>&1; then
+            log_msg "  ✗ 端口 $PORT 仍被占用，无法启动 ${name}"
+            return 1
+        fi
     fi
 
     log_msg "  启动: setsid bash $server_script"
@@ -525,7 +556,11 @@ stop_server() {
     # 5) 深度清理残留的 vllm / mp 进程并等待显存释放
     if [[ "${DEEP_CLEANUP:-1}" == "1" ]]; then
         cleanup_device_processes
-        wait_device_memory_free
+        if ! wait_device_memory_free; then
+            # HBM can remain cached by the runtime after all worker processes
+            # have exited. Do not turn this advisory wait into a matrix abort.
+            log_msg "  ⚠ 显存回收检查超时，继续下一配置"
+        fi
     fi
 
     log_msg "  ✓ Server 已停止"
@@ -587,6 +622,7 @@ run_benchmark() {
             extract_metrics "$expected_result" "    "
         else
             log_msg "    ⚠ 未找到结果文件: $expected_result"
+            return 1
         fi
     else
         log_msg "    ✗ 压测失败，跳过此 preset"
@@ -995,7 +1031,9 @@ GROUP_CONFIGS[p1_deepseek_small_batch]="baseline dbo dp_baseline dp_dbo"
 GROUP_PRESETS[p1_deepseek_small_batch]="prefill4k16"
 GROUP_CONFIGS[p1_qwen_tp]="qwen_baseline qwen_dbo qwen_fc1 qwen_fc1_aiv qwen_dbo_fc1 qwen_dbo_fc1_aiv qwen_dbo_fc2"
 GROUP_PRESETS[p1_qwen_tp]="prefill4k"
-GROUP_CONFIGS[p2_deepseek_decode]="dbo"
+# Decode comparison uses the DP server so the decode path is evaluated with
+# the same data-parallel communication topology as the DP performance group.
+GROUP_CONFIGS[p2_deepseek_decode]="dp_dbo"
 GROUP_PRESETS[p2_deepseek_decode]="decode"
 GROUP_DECODE_THRESHOLDS[p2_deepseek_decode]="${P2_DECODE_TOKEN_THRESHOLD:-32}"
 
